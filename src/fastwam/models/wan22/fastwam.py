@@ -144,6 +144,7 @@ class FastWAM(torch.nn.Module):
         if int(len(action_expert.blocks)) != int(len(video_expert.blocks)):
             raise ValueError("ActionDiT `num_layers` must match video expert.")
 
+        # mot 中专家的 name 分别是 video 和 action
         mot = MoT(
             mixtures={"video": video_expert, "action": action_expert},
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
@@ -275,13 +276,20 @@ class FastWAM(torch.nn.Module):
         return frames
 
     def build_inputs(self, sample, tiled: bool = False):
-        video = sample["video"]
+        """
+        校验形状与帧数约束
+        video 送 VAE 得到 input_latents；
+        context/context_mask/可选 action_is_pad/image_is_pad 转 device/dtype；
+        若启用 proprio_encoder 则把首步 proprio 拼进 context 并扩展 context_mask
+        """
+        # sample 必备字段（build_inputs）：video、action、context、context_mask；可选字段：proprio、action_is_pad、image_is_pad
+        video = sample["video"]  # [B,3,T,H,W]，多相机拼成的一段视频张量（经数据集归一化等）
         if "context" not in sample or "context_mask" not in sample:
             raise ValueError(
                 "FastWAM training requires `sample['context']` and `sample['context_mask']`."
             )
-        context = sample["context"]
-        context_mask = sample["context_mask"]
+        context = sample["context"]  # 不直接放字符串；context 是 T5 等预计算文本嵌入 [B,L,D]
+        context_mask = sample["context_mask"]  # [B,L] 标哪些位置是真实 token
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -301,7 +309,7 @@ class FastWAM(torch.nn.Module):
         if "action" not in sample:
             raise ValueError("`sample['action']` is required for FastWAM training.")
 
-        action = sample["action"]
+        action = sample["action"]  # 形状 [B, T_action, a_dim]，且 T_action 必须能被 num_frames-1 整除，用来对齐视频转移步
         if action.ndim != 3:
             raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
         action_horizon = int(action.shape[1])
@@ -339,6 +347,7 @@ class FastWAM(torch.nn.Module):
 
         first_frame_latents = None
         fuse_flag = False
+        # 仅在 video_expert.fuse_vae_embedding_in_latents == True 时，first_frame_latents 才非空。后面将干净的首帧与加噪的未来帧合并
         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
             first_frame_latents = input_latents[:, :, 0:1]
             fuse_flag = True
@@ -446,127 +455,154 @@ class FastWAM(torch.nn.Module):
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
     def training_loss(self, sample, tiled: bool = False):
-        inputs = self.build_inputs(sample, tiled=tiled)
-        input_latents = inputs["input_latents"]
-        batch_size = input_latents.shape[0]
-        context = inputs["context"]
-        context_mask = inputs["context_mask"]
-        action = inputs["action"]
-        action_is_pad = inputs["action_is_pad"]
-        image_is_pad = inputs["image_is_pad"]
+        # 从 sample 组训练批：潜变量、条件上下文、动作与 padding 掩码。
+        inputs = self.build_inputs(sample, tiled=tiled)  # 解析并张量化 batch
+        input_latents = inputs["input_latents"]  # 视频潜变量，[B, C_lat, T_lat, H_lat, W_lat]，C_lat：VAE 潜空间通道；T_lat：潜空间时间长度（帧）；H_lat, W_lat：潜空间高宽
+        batch_size = input_latents.shape[0]  # 当前批大小
 
-        noise_video = torch.randn_like(input_latents)
+        # 关于“条件嵌入”的条件：除去待去噪的量之外，告诉模型任务/场景是什么，并参与 cross-attn 那一侧的信息
+        context = inputs["context"]  # 条件嵌入（如文本，也有其他条件信息），[B, L, D_ctx]；L：条件序列长度（如 T5 token 数）；D_ctx：每条条件的嵌入维度（预计算文本向量维）。
+        # 掩码：布尔（或等价）标记 哪些位置参与计算、哪些应忽略。
+        # context_mask：给 cross-attention：序列长度固定为 L 时，pad 位置不应参与注意力（否则模型会 attend 到无意义的填充向量）
+        # 在序列维度 L 上 pad，context_mask 的维度是 [B, L]，每个位置的值为 true 或者是 false
+        # pad 的目的是为了组 batch，截断/补到固定 L（如 context_len=128） 才能堆成 [B, L, D_ctx]。告诉模型哪些位置是真 token：pad 位不应当 K/V 被 attend
+        # Query 来自视频/动作 token，Key/Value 来自 context 的 L 个位置
+        # 视频、动作 DiT 里条件分支共用该掩码
+        context_mask = inputs["context_mask"]  # 条件序列有效位，[B, L]，context 对应的有效位掩码，用于 cross-attention 里屏蔽掉无效/pad 的 token。
+
+        action = inputs["action"]  # 动作轨迹，[B, T_a, A]，T_a：动作步数（时间步）；A：动作维度（各关节/末端等）
+        action_is_pad = inputs["action_is_pad"]  # 动作步无效标记，用于 动作损失按步加权，为 pad 步则不算入平均 loss，[B, T_a]
+        # T_lat 与像素 T_pix 由 VAE 时间下采样联系；T_a 须被 (T_pix−1) 整除
+        image_is_pad = inputs["image_is_pad"]  # 视频帧无效标记，用于 视频重建/扩散损失按帧加权，[B, T_pix]，T_pix：像素视频帧数，与 sample["video"] 的 T 一致（[B,3,T,H,W] 里的 T）
+
+        # 视频分支扩散训练：加噪前向 + 回归目标
+        noise_video = torch.randn_like(input_latents)  # 纯高斯噪声，[B, C_lat, T_lat, H_lat, W_lat]
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=input_latents.dtype,
-        )
-        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
-        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+        )  # 每个样本随机采样的扩散步 t，维度为 [B]，每个样本一个标量时间步，内部再除以 num_train_timesteps 得到 sigma（位于0-1的时间参数）
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)  # 加噪后的视频潜变量，作为 DiT 输入，文中 5 式，[B, C_lat, T_lat, H_lat, W_lat]
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)  # 6 式中的 epsl-y，[B, C_lat, T_lat, H_lat, W_lat]，与 input_latents 相同
 
-        if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+        # 若开启首帧与潜变量融合：第一帧不加噪，保持干净条件
+        if inputs["first_frame_latents"] is not None:  # 首帧潜变量维度：[B, C_lat, 1, H_lat, W_lat]
+            latents[:, :, 0:1] = inputs["first_frame_latents"]  # 把时间维第 0 段换成干净首帧（没有加噪），输入 Video DiT
 
-        noise_action = torch.randn_like(action)
+        # 动作分支扩散训练：与视频分支类似，在动作空间加噪、采样 t、构造监督目标
+        noise_action = torch.randn_like(action)  # 与 action 同形状的高斯噪声，[B, T_a, A]
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=action.dtype,
-        )
-        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
-        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+        )  # 每个样本随机采样的动作扩散步 t，维度=样本数，即 [B]
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)  # t 时刻加噪后的动作，作为动作 DiT 输入，[B, T_a, A]
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)  # 与 train_action_scheduler 一致的回归目标，[B, T_a, A]
 
-        video_pre = self.video_expert.pre_dit(
-            x=latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            action=action,
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-        )
+        video_pre = self.video_expert.pre_dit(  # 视频分支编码
+            x=latents,  # 视频加噪潜变量，[B, C_lat, T_lat, H_lat, W_lat] --> vedio["tokens"]=[B, S_v, D]，S_v = f·h·w，表示时间、高、宽共 3 个维度上
+            timestep=timestep_video,  # 视频分支扩散步，等于样本数，即 [B]
+            context=context,  # 文本条件，[B, L，D_ctx]。L 指条件序列在 token 维上的长度，D_ctx 指的是单个条件 token 的向量维度
+            context_mask=context_mask,  # 条件序列掩码，[B, L]，那么位置应该参与计算，哪些位置应该忽略
+            action=action,  # [B, T_a, A]。pre_dit 始终可接收 action，但 configs/model/fastwam.yaml 里默认为false，只扩展文本 context_mask
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],  # bool，训练 training_loss 里 latents[:,:,0:1] 被换成干净首帧，不监督首帧
+        )  # 包含 vedio tokens 等信息的字典
 
-        action_pre = self.action_expert.pre_dit(
-            action_tokens=noisy_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
-        )
+        action_pre = self.action_expert.pre_dit(  # 动作分支编码
+            action_tokens=noisy_action,  # 加噪后的动作，[B, T_a, A]
+            timestep=timestep_action,  # 动作分支扩散步，[B]
+            context=context,  # 文本条件，[B, L，D_ctx]
+            context_mask=context_mask,  # 条件序列掩码，[B, L]
+        )  # 包含 action tokens 等信息的字典
 
-        video_tokens = video_pre["tokens"]
-        action_tokens = action_pre["tokens"]
+        # 从 pre_dit 取双流 token，按帧宽构造联合注意力掩码，再经 MoT 做跨模态 Transformer。
+        video_tokens = video_pre["tokens"]  # 对 加噪潜变量 做 patch 嵌入 再展平得到的 视频 token 序列，[B, S_v, D]，S_v = f·h·w（潜空间上 f×高×宽 的 patch 数），D = hidden_dim
+        action_tokens = action_pre["tokens"]  # 对 加噪动作 经 action_encoder 得到的 动作 token 序列，供 MoT 动作支路用。[B, S_a, D]，S_a = T_a（动作序列长度，与 action.shape[1] 一致），D 与视频侧 相同（同一 MoT 对齐）。
 
-        attention_mask = self._build_mot_attention_mask(
-            video_seq_len=video_tokens.shape[1],
-            action_seq_len=action_tokens.shape[1],
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_tokens.device,
-        )
-        tokens_out = self.mot(
+        # 按帧宽构造联合注意力掩码
+        attention_mask = self._build_mot_attention_mask(  # 视频/动作 token 可见性
+            video_seq_len=video_tokens.shape[1],  # 视频序列长度，S_v
+            action_seq_len=action_tokens.shape[1],  # 动作序列长度，S_a
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),  # 不是张量，是 int 标量，表示单帧潜空间 patch token 数
+            device=video_tokens.device,  # 与激活同设备
+        )  # 布尔或屏蔽矩阵，供注意力用。[S_v + S_a, S_v + S_a]，mask[i, j] == True 表示 联合注意力里位置 i 的 Q 可以看位置 j 的 K；False 则 禁止
+
+        # mot：Video token 和 Action token 先拼接（联合）在一起做联合自注意力，再各自接条件交叉注意力（cross-atten）
+        # tokens_out["video"]： 经过 MoT 全部层 后的 视频侧隐状态序列，[B, S_v, D]，与送入时的 video_tokens 同形
+        # tokens_out["action"]：动作侧 经 MoT 更新后的 隐状态序列，[B, S_a, D]，与送入时的 action_tokens 同形
+        tokens_out = self.mot(  # 联合 DiT（双流注意力）
             embeds_all={
-                "video": video_tokens,
-                "action": action_tokens,
+                "video": video_tokens,  # 视频嵌入，一条 token 序列 [B, S_v, D]
+                "action": action_tokens,  # 动作嵌入，一条 token 序列 [B, S_a, D]
             },
-            attention_mask=attention_mask,
+            attention_mask=attention_mask,  # 联合掩码：约束 video↔video、action↔action、action↔video 等谁能看谁，[S_v + S_a, S_v + S_a]
             freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
+                "video": video_pre["freqs"],  # 视频 token 的 RoPE（旋转位置编码） 相位参数；使注意力带相对位置的信息
+                "action": action_pre["freqs"],  # 动作 token 的 RoPE 频率表，作用在已投影的 Q 和 K 上（经过了矩阵相乘的 Q 和 K 上）
             },
             context_all={
                 "video": {
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
+                    "context": video_pre["context"],  # [B, L_cond, D]，L_cond 是文本条件序列，可能包含动作；作为 K/V，供 每个视频 token 做 cross-attn
+                    "mask": video_pre["context_mask"],  # [B, S_v, L_cond]，每个 视频 query 位置 对 各条件 key 是否可见
                 },
                 "action": {
-                    "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
+                    "context": action_pre["context"],  # [B, L_text, D]，动作 token 的 cross-attn K/V
+                    "mask": action_pre["context_mask"],  # [B, S_a, L_text]，文本 pad 等屏蔽
+
                 },
             },
-            t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
+            t_mod_all={  # t_mod = 由 扩散步 timestep_* 经 time_projection 得到的 AdaLN（自适应层归一化） 用调制（modulate）量（拆成 6 份：与 DiT block 里 MSA/MLP 的 shift、scale、gate 等对应）
+                "video": video_pre["t_mod"],  # [B, S_v, 6, D]，每个视频 patch token 一套
+                "action": action_pre["t_mod"],  # [B, 6, D]，整条动作序列共用一套
             },
-        )
+        )  # 更新后的 video/action token
 
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        # MoT token 经 post_dit 解码为预测，其中 C_out = C_lat = VAE潜空间通道数 = 48（仓库配置）
+        # video_expert / action_expert 各是一套 Video DiT / Action DiT，post_dit 只做 把 MoT 输出的 D 维 token 投回任务空间（潜空间或动作维），不再经过 MoT
+        # pred_video 和 pre_action 均为流匹配的头，是与训练目标 epsl-y 对齐的模型输出 f_\theta。
+        # pred_vedio 是被还原的 VAE 潜空间张量；pred_action 是动作序列预测，与加噪动作 / 训练目标 target_action 对齐，用于 动作 MSE
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)  # [B, C_out, T_lat, H_lat, W_lat]，与 input_latents / target_video 同形（C_out 为 DiT 配置的 out_dim，与 VAE 潜通道对齐）
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)  # [B, T_a, A]，与 action / target_action 同形
 
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        # 根据是否有首帧条件计算 Video loss
+        include_initial_video_step = inputs["first_frame_latents"] is None  # 无首帧条件时 首帧与其它帧一样参与 loss
+        if inputs["first_frame_latents"] is not None:  # 有首帧条件时，首帧不监督
+            pred_video = pred_video[:, :, 1:]  # 去掉条件首帧，仅监督后续帧
+            target_video = target_video[:, :, 1:]  # 与 pred 对齐，避免监督首帧
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+        # 视频/动作分支各自聚合损失并乘时间步权重，再按 λ 合成总 loss 与日志分项。
+        loss_video_per_sample = self._compute_video_loss_per_sample(  # 每样本视频损失（已处理帧 pad）
+            pred_video=pred_video,  # 潜空间预测，[B, C_out, T_lat, H_lat, W_lat]
+            target_video=target_video,  # epsl-y，[B, C_lat, T_lat, H_lat, W_lat]
+            image_is_pad=image_is_pad,  # 帧无效掩码，[B, T_pix]
+            include_initial_video_step=include_initial_video_step,  # 首帧是否计入时序
+        )  # [B]
 
-        loss_video_per_sample = self._compute_video_loss_per_sample(
-            pred_video=pred_video,
-            target_video=target_video,
-            image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
-        )
-        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(  # timestep_video 指视频分支的扩散步，维度是 [B]
             loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
-        )
-        loss_video = (loss_video_per_sample * video_weight).mean()
+        )  # 与损失同设备 dtype，与 timestep_video 同维度，具体是 [B]
+        loss_video = (loss_video_per_sample * video_weight).mean()  # 标量
 
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)  # [B,T]，逐步 MSE，先把最后一个动作维度平均
         if action_is_pad is not None:
-            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)  # 有效动作步
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)  # 每序列有效步数，防除零
+            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum  # 每样本损失：[B,T] --> [B]
         else:
-            action_loss_per_sample = action_loss_token.mean(dim=1)
+            action_loss_per_sample = action_loss_token.mean(dim=1)  # 无 pad 时对时间维均值
 
         action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
             action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
-        )
-        loss_action = (action_loss_per_sample * action_weight).mean()
+        )  # 动作时间步权重，维度是 [B]
+        loss_action = (action_loss_per_sample * action_weight).mean()  # 标量
 
-        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action  # 联合优化目标
         loss_dict = {
-            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
-            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),  # 分项（含 λ）
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),  # 分项（含 λ）
         }
-        return loss_total, loss_dict
-
+        return loss_total, loss_dict  # 总 loss 与可记录字典
+        
     @torch.no_grad()
     def _predict_joint_noise(
         self,

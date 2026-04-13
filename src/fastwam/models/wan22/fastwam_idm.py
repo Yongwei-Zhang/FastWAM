@@ -55,6 +55,7 @@ class FastWAMIDM(FastWAMJoint):
         mask[cond_end:, noisy_end:cond_end] = True
         return mask
 
+    # fastwam 模型变体：FastWAMIDM
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]

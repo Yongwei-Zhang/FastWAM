@@ -1,0 +1,194 @@
+# Cursor: exclude from indexing & AI context (gitignore syntax).
+# Base: mirrors .gitignore; extras below for weights, media, and log-style dirs.
+
+.vscode
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+*.zip
+*.npy
+*.mp4
+*.png
+*.gif
+*.pth
+*.pt
+*.safetensors
+data/processed*
+data/raw*
+MemFlow/
+output/
+outputs/
+wandb/*
+slurm-*.out
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pipenv / poetry / pdm / pixi (commented lockfiles left out of gitignore)
+.pdm-python
+.pdm-build/
+.pixi
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Abstra
+.abstra/
+
+# Ruff stuff:
+.ruff_cache/
+
+# PyPI configuration file
+.pypirc
+
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+
+checkpoints/*
+wandb/*
+logs/*
+datasets/*
+
+scripts_new/
+scripts/run_local.sh
+scripts/manual_multi_node_srun.sh
+
+# --- Same intent as .gitignore lines for .cursorignore / .cursorindexingignore (git-only);
+#     do not list this file here so Cursor can still read these rules. ---
+
+# --- Extra: more media + log / experiment output dirs (*.pt, *.mp4, *.pth already above) ---
+*.webm
+*.avi
+*.mov
+*.txt
+*.pkl
+*.json
+logs/
+log/
+**/logs/
+**/log/
+runs/
+lightning_logs/
+mlruns/
+tensorboard/
+tb_logs/
+tensorboard_logs/

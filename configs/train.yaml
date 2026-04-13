@@ -18,9 +18,9 @@ lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
 num_epochs: 1
 max_steps: null
-log_every: 10
+log_every: 10  # 打印训练损失信息的间隔步骤
 save_every: 100
-eval_every: 50
+eval_every: 50  # 评估间隔
 eval_num_inference_steps: 10
 
 # training

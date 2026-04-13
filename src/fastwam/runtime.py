@@ -18,8 +18,11 @@ from .utils import misc
 
 logger = get_logger(__name__)
 
+# --- 训练/推理运行时：Hydra instantiate 目标、数据集接线、CLI 入口 ---
+
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
+    # 将 cfg.mixed_precision 归一化为允许集合（供 Trainer / 模型 dtype）
     if not isinstance(mixed_precision, str):
         raise ValueError(f"`mixed_precision` must be str, got {type(mixed_precision)}")
     key = mixed_precision.strip().lower()
@@ -32,6 +35,7 @@ def _normalize_mixed_precision(mixed_precision: str) -> str:
 
 
 def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
+    # 将 cfg 的 mixed_precision 转为 torch.dtype（权重与 autocast）
     precision = _normalize_mixed_precision(mixed_precision)
     if precision == "no":
         return torch.float32
@@ -52,6 +56,7 @@ def create_wan22_model(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    # Wan2.2 主干（视频 DiT + tokenizer）；可由 cfg.model._target_ 经 Hydra 调用
     from .models.wan22.wan22 import Wan22Core
 
     if isinstance(dit_config, DictConfig):
@@ -59,6 +64,7 @@ def create_wan22_model(
     if not isinstance(dit_config, dict):
         raise ValueError(f"`dit_config` must resolve to a dict, got {type(dit_config)}")
 
+    # 从 HF 预训练加载 Wan2.2，并按 dit_config 构建 DiT
     return Wan22Core.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -91,6 +97,7 @@ def create_fastwam(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    # FastWAM：视频+动作头、扩散调度与 loss 权重均来自 cfg
     from .models.wan22.fastwam import FastWAM
 
     if isinstance(video_dit_config, DictConfig):
@@ -98,6 +105,7 @@ def create_fastwam(
     if not isinstance(video_dit_config, dict):
         raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
 
+    # 可选动作 DiT 子配置；空 dict 表示使用 FastWAM 内部默认
     if isinstance(action_dit_config, DictConfig):
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
     if action_dit_config is None:
@@ -105,6 +113,7 @@ def create_fastwam(
     if not isinstance(action_dit_config, dict):
         raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
 
+    # 视频 / 动作分支扩散步数（动作分支必填）
     if isinstance(video_scheduler, DictConfig):
         video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
     if video_scheduler is None:
@@ -133,6 +142,7 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    # 加载预训练 Wan2.2 并构建 FastWAM 各头与训练 loss 权重
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -176,6 +186,7 @@ def create_fastwam_joint(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    # 联合视频-动作变体（cfg 形态同 create_fastwam，实现类不同）
     from .models.wan22.fastwam_joint import FastWAMJoint
 
     if isinstance(video_dit_config, DictConfig):
@@ -218,7 +229,7 @@ def create_fastwam_joint(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
-    return FastWAMJoint.from_wan22_pretrained(
+    return FastWAMJoint.from_wan22_pretrained(  # 与 FastWAM 相同的预训练加载流程
         device=device,
         torch_dtype=model_dtype,
         model_id=model_id,
@@ -261,6 +272,7 @@ def create_fastwam_idm(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    # FastWAM 的反动力学（IDM）变体，结构随任务配置而异
     from .models.wan22.fastwam_idm import (
         FastWAMIDM,
     )
@@ -305,7 +317,7 @@ def create_fastwam_idm(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
-    return FastWAMIDM.from_wan22_pretrained(
+    return FastWAMIDM.from_wan22_pretrained(  # IDM 头 + 与 Wan2.2 主干一致的加载约定
         device=device,
         torch_dtype=model_dtype,
         model_id=model_id,
@@ -331,10 +343,13 @@ def create_fastwam_idm(
 
 
 def build_datasets(data_cfg: DictConfig):
+    # 训练集：若未指定统计文件路径，可能在 work_dir 下计算并保存 dataset_stats.json
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:
+        # 未单独配置 val：复用训练集对象（如 LIBERO 常用）
         val_ds = train_ds
     else:
+        # 验证集须使用固定的动作/状态归一化统计（本次 run 目录或显式 JSON）
         train_stats_path = data_cfg.train.get("pretrained_norm_stats")
         default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
         val_stats_path = data_cfg.val.get("pretrained_norm_stats")
@@ -345,6 +360,7 @@ def build_datasets(data_cfg: DictConfig):
 
 
 def _resolve_train_device() -> str:
+    # One process -> one GPU via LOCAL_RANK (Accelerate/torchrun); fallback cpu / cuda:0.
     if not torch.cuda.is_available():
         return "cpu"
     device_count = torch.cuda.device_count()
@@ -357,10 +373,12 @@ def _resolve_train_device() -> str:
 
 
 def run_training(cfg: DictConfig):
+    # Hydra 训练入口：持久化配置，构建模型 + 数据，委托给 Wan22Trainer
     setup_logging(
         log_level=logging.INFO,
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
     )
+    # 输出目录注册为全局目录，后面保存 dataset_stats.json、state 等会用
     misc.register_work_dir(cfg.output_dir)
     config_payload = OmegaConf.to_container(cfg, resolve=True)
     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
@@ -372,6 +390,7 @@ def run_training(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     train_ds, val_ds = build_datasets(cfg.data)
 
+    # 把 cfg、model、train_dataset、val_dataset 打包进 Trainer
     trainer = Wan22Trainer(
         cfg=cfg,
         model=model,
@@ -381,6 +400,7 @@ def run_training(cfg: DictConfig):
     trainer.train()
 
 def run_inference(cfg: DictConfig):
+    # Single-image -> video CLI path (not the LIBERO sim eval script).
     setup_logging(log_level=logging.INFO)
     inference_cfg = cfg.inference
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
@@ -396,8 +416,9 @@ def run_inference(cfg: DictConfig):
         else:
             logger.warning("Checkpoint not found, skipping load: %s", checkpoint_path)
     model.eval()
-    
+
     def center_crop_resize(img: Image, width: int, height: int) -> Image.Image:
+        # Match training-style resize: cover then center crop to cfg width/height.
         src_w, src_h = img.size
         scale = max(width / src_w, height / src_h)
         resized = img.resize((round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR)
@@ -411,7 +432,7 @@ def run_inference(cfg: DictConfig):
     arr = np.array(input_image, dtype=np.float32)
     x = torch.from_numpy(arr)
     x = x.to(device=model.device, dtype=model.torch_dtype)
-    x = x * (2.0 / 255.0) - 1.0
+    x = x * (2.0 / 255.0) - 1.0  # [0,255] -> [-1,1]
     x = repeat(x, "H W C -> B C H W", B=1)
     output_mp4 = str(inference_cfg.output_mp4)
 
@@ -429,7 +450,7 @@ def run_inference(cfg: DictConfig):
         "tiled": bool(inference_cfg.tiled),
     }
 
-    infer_out = model.infer(**infer_kwargs)
+    infer_out = model.infer(**infer_kwargs)  # Wan2.2 / FastWAM image-conditioned video sample
     video = infer_out["video"]
     save_mp4(video, output_mp4, fps=15)
     logger.info("Saved inference video to %s", output_mp4)

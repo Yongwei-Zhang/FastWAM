@@ -107,6 +107,9 @@ fi
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
 
+# deepseed 配置文件用来告诉 Deepspeed 训练如何做分布式与显存优化
+# train_zero1.sh/train_zero2.sh 通过 accelerate 把这些设置传给训练进程，从而决定速度与显存占用。
+# 设置 RUN_ID=2026-04-09_08-25-37 是为了让 output_dir 仍指向你上次那次 run
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
   --num_processes "${NPROC_PER_NODE}" \

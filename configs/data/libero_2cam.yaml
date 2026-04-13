@@ -32,6 +32,7 @@ train:
   camera_key: null
   val_set_proportion: 0.0
   is_training_set: true
+  pretrained_norm_stats: null  # 显示写入键，在持续训练时能够直接赋值
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"
   processor:

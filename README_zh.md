@@ -125,6 +125,9 @@ mkdir -p data/robotwin2.0
 cd data/robotwin2.0
 
 # 下载全部 robotwin2.0.tar.gz.part-* 文件后执行
+# 大文件在 Hugging Face 上常被拆成多个 robotwin2.0.tar.gz.part-xx。
+# 每个分卷只是整份压缩包连续字节流里的一段，单独打开没有意义，必须按顺序拼回一条流，才等价于原来的 robotwin2.0.tar.gz
+# tar -xzf -：-x 解压，-z 表示 gzip，- 表示从标准输入读。「拼好的流 → 直接喂给 tar」，解压到当前目录
 cat robotwin2.0.tar.gz.part-* | tar -xzf -
 ```
 
@@ -146,6 +149,8 @@ data/robotwin2.0/dataset_stats.json
 
 可直接作为本仓库当前配置使用的统计文件，也可重新计算。
 
+该 json 文件的作用：RoboTwin 这条数据线上 action/state 的归一化参数表，用来和模型训练、推理时的数值范围一致
+
 ## 使用 Release 权重推理
 
 release 的模型权重以及对应的 dataset stats 已经发布到 [Hugging Face](https://huggingface.co/yuanty/fastwam).
@@ -155,6 +160,7 @@ release 的模型权重以及对应的 dataset stats 已经发布到 [Hugging Fa
 ```bash
 pip install -U huggingface_hub
 
+# 224/384：输入视觉的分辨率设定
 huggingface-cli download yuanty/fastwam \
   libero_uncond_2cam224.pt \
   libero_uncond_2cam224_dataset_stats.json \
@@ -174,9 +180,17 @@ checkpoints/fastwam_release/
 ```
 
 `LIBERO` benchmark 评测前，请先按 [LIBERO 官方仓库](https://github.com/Lifelong-Robot-Learning/LIBERO) 安装环境：
-最后一步执行：
-
+注意是将相关文件安装在 fastwam 环境中，而不是 libero 环境中（创建 libero 环境没有意义），主要执行：
 ```bash
+# LIBERO 与 FastWAM 在同一个文件夹下
+cd ../LIBERO
+pip install -r requirements.txt
+pip install -e .
+```
+
+最后一步执行：
+```bash
+# 在 fastwam 环境中
 pip install mujoco==3.3.2
 ```
 
@@ -187,6 +201,7 @@ pip install mujoco==3.3.2
 再创建 policy 软链接：
 
 ```bash
+# 把 FastWAM 的 fastwam_policy 实现「挂」到 RoboTwin 期望的 policy/fastwam_policy 位置，避免 2 份代码拷贝不同步
 ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwin/policy/fastwam_policy"
 ```
 
@@ -226,6 +241,8 @@ python experiments/robotwin/run_robotwin_manager.py \
 
 ### 1) 训练前先预计算 T5 embedding cache
 
+作用：把 LIBERO 数据里任务文本的 T5/文本编码器 embedding 预先算好并写入 text_embedding_cache_dir，供后续训练直接读缓存
+
 使用 `scripts/precompute_text_embeds.py`，按训练 task 预计算：
 
 ```bash
@@ -239,7 +256,11 @@ python scripts/precompute_text_embeds.py task=robotwin_uncond_3cam_384_1e-4
 如需多卡可用：
 
 ```bash
+# libero
 torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
+
+# robotwin
+torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=robotwin_uncond_3cam_384_1e-4
 ```
 
 
@@ -249,8 +270,14 @@ torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=
 跑完一次训练后，会在当前 run 目录生成 `dataset_stats.json`（例如 `runs/{task_name}/{run_id}/dataset_stats.json`），
 后续就可以把 `pretrained_norm_stats` 改成该文件路径。
 
+pretrained_norm_stats 在代码里是可选的：不配时就是 None，RobotVideoDataset 会在训练集上现算归一化统计并写到 get_work_dir()/dataset_stats.json
+robotwin.yaml 写上该路径，是因为配置里已经在 ./data/robotwin2.0/ 里有一份随数据/文档提供的 dataset_stats.json，训练直接加载，省得再算。
+libero_2cam 没有随仓库约定这样一个固定路径，所以用省略 = 首次训练自动算即可；若你以后自己算好并想固定复用，再像 RoboTwin 那样加上 pretrained_norm_stats: /path/to/dataset_stats.json 就行
+
+dataset_stats.json 是训练集上算出的动作/状态等归一化统计（供 FastWAMProcessor 设 normalizer）。数据与任务与上次一致时，用这份统计是合理的；训练未完成不影响「统计已算完并写入」这一事实。
+
 ```bash
-# LIBERO
+# LIBERO，8 表示单机启动 8 个训练进程 = 用 8 张 GPU（默认每进程绑一张卡）
 bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
 
 # RoboTwin

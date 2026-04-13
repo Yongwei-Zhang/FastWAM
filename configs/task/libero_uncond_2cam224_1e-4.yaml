@@ -6,8 +6,11 @@ defaults:
   - _self_
 
 # dataloading
+# 如果设置过大容易导致 Libero 训练时 GPU OOM
 batch_size: 16
-num_workers: 8
+
+# 如果设置过大容易导致 Libero 训练时 CPU OOM
+num_workers: 2
 
 model:
   mot_checkpoint_mixed_attn: false
@@ -16,7 +19,8 @@ model:
 lr_scheduler_type: "cosine"
 learning_rate: 1e-4
 num_epochs: 10
-max_steps: null
+# max_steps: null
+max_steps: 20000
 log_every: 10
 save_every: 2000
 eval_every: 200

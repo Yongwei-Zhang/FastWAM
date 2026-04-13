@@ -57,6 +57,14 @@ run_libero_eval() {
 
     require_non_empty "MAX_TASKS_PER_GPU"
     require_non_empty "NUM_TRIALS"
+
+    # 捕获 conda 初始化脚本路径，供 tmux pane 中激活环境
+    if [[ -n "${CONDA_EXE:-}" ]]; then
+        CONDA_INIT_SH="$(dirname "$(dirname "$CONDA_EXE")")/etc/profile.d/conda.sh"
+    else
+        CONDA_INIT_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
+    fi
+
     TMUX_GRID_ROWS=${TMUX_GRID_ROWS:-1}
     TMUX_GRID_COLS=${TMUX_GRID_COLS:-$((MAX_TASKS_PER_GPU + 1))}
     GRID_ROWS=$TMUX_GRID_ROWS
@@ -335,7 +343,9 @@ run_libero_eval() {
         # When the task exits, write a status file so the scheduler can detect failures promptly.
         tmux select-pane -t $SESSION_NAME:$pane_info 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
-        tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+        # 添加激活 fastwam 环境，防止报“ 没有 hydra ”的错误
+        tmux send-keys -t $SESSION_NAME:$pane_info "source $CONDA_INIT_SH && conda activate fastwam && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+            export MUJOCO_GL=egl && export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH:-} && \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
             CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
             task=$CONFIG ckpt=$CKPT \

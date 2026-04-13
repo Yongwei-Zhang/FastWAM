@@ -121,6 +121,7 @@ def run_evaluation(
         raise
 
 
+# 固定用 config_name="sim_libero.yaml"，MULTIRUN.task_suite_names 以 configs/sim_libero.yaml 为准。
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
 def main(cfg: DictConfig):
     if cfg.ckpt is None:

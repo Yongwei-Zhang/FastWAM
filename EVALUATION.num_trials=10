@@ -1,0 +1,100 @@
+task_file: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/tasks.txt
+EXP_NAME: 
+Evaluation results will be saved to: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237
+Task list file copied to: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/tasks.txt
+NUM_GPUS: 1, AVAILABLE_GPUS: 0
+CKPT: ./checkpoints/fastwam_release/libero_uncond_2cam224.pt
+CONFIG: libero_uncond_2cam224_1e-4
+ROOT_DIR: /home/YongweiZhang/Github_Projects/FastWAM
+NUM_GPUS: 1
+MAX_TASKS_PER_GPU: 4
+GPU load tracking initialized: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/gpu_load.txt
+Session 'libero_test_v3' has been deleted
+[2026-04-12 05:02:37] Starting dynamic task scheduling...
+[2026-04-12 05:02:37] Total tasks: 40
+[2026-04-12 05:02:37] Max tasks per GPU: 4
+[2026-04-12 05:02:37] Available GPUs: 0
+[2026-04-12 05:02:37] Starting the initial launch phase...
+[2026-04-12 05:02:37] Planning to launch up to 4 initial tasks
+[2026-04-12 05:02:37] Loaded 40 tasks
+[2026-04-12 05:02:37] Processing task: suite=libero_10, task_id=0
+[2026-04-12 05:02:37] Assigned task: libero_10 task_id=0 -> GPU0 (load: 1/4)
+[2026-04-12 05:02:37] Launching task: libero_10 task_id=0 on GPU0 pane 0.0
+[2026-04-12 05:02:37] Processing task: suite=libero_10, task_id=1
+[2026-04-12 05:02:37] Assigned task: libero_10 task_id=1 -> GPU0 (load: 2/4)
+[2026-04-12 05:02:37] Launching task: libero_10 task_id=1 on GPU0 pane 0.1
+[2026-04-12 05:02:38] Processing task: suite=libero_10, task_id=2
+[2026-04-12 05:02:38] Assigned task: libero_10 task_id=2 -> GPU0 (load: 3/4)
+[2026-04-12 05:02:38] Launching task: libero_10 task_id=2 on GPU0 pane 0.2
+[2026-04-12 05:02:38] Processing task: suite=libero_10, task_id=3
+[2026-04-12 05:02:38] Assigned task: libero_10 task_id=3 -> GPU0 (load: 4/4)
+[2026-04-12 05:02:38] Launching task: libero_10 task_id=3 on GPU0 pane 0.3
+[2026-04-12 05:02:39] Initial launch completed, started 4 tasks
+[2026-04-12 05:02:39] === Scheduling Status 05:02:39 ===
+[2026-04-12 05:02:39] Total tasks: 40
+[2026-04-12 05:02:39] Completed: 0
+[2026-04-12 05:02:39] Remaining: 40
+[2026-04-12 05:02:39] Running: 4
+[2026-04-12 05:02:39] Pending: 36
+[2026-04-12 05:02:39] Failed: 0
+[2026-04-12 05:02:39] Launched this round: 0
+[2026-04-12 05:02:39] === GPU Load Status ===
+[2026-04-12 05:02:39] GPU 0: 4/4 tasks (100%)
+[2026-04-12 05:02:39] ==================
+[2026-04-12 05:02:39] === Debug Info ===
+[2026-04-12 05:02:39] GPU load file contents:
+[2026-04-12 05:02:39]   GPU0: 4
+[2026-04-12 05:02:39] Number of running tasks: 4
+[2026-04-12 05:02:39] Running tasks:
+[2026-04-12 05:02:39]   libero_10,0 -> GPU0
+[2026-04-12 05:02:39]   libero_10,1 -> GPU0
+[2026-04-12 05:02:39]   libero_10,2 -> GPU0
+[2026-04-12 05:02:39]   libero_10,3 -> GPU0
+[2026-04-12 05:02:39] Number of pending tasks: 36
+[2026-04-12 05:02:39] Number of failed tasks: 0
+[2026-04-12 05:02:39] ===================
+
+[2026-04-12 05:02:49] Task failed: libero_10 task_id=0 rc=1 GPU0 (current load: 3/4)
+[2026-04-12 05:02:49] Task failed: libero_10 task_id=1 rc=1 GPU0 (current load: 2/4)
+[2026-04-12 05:02:49] Task failed: libero_10 task_id=2 rc=1 GPU0 (current load: 1/4)
+[2026-04-12 05:02:49] Task failed: libero_10 task_id=3 rc=1 GPU0 (current load: 0/4)
+Detected failed subtasks, stopping the scheduler. Failure details: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/failed_tasks.txt
+2026-04-12 05:02:49,libero_10,0,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task0_gpu0.log
+2026-04-12 05:02:49,libero_10,1,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task1_gpu0.log
+2026-04-12 05:02:49,libero_10,2,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task2_gpu0.log
+2026-04-12 05:02:49,libero_10,3,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task3_gpu0.log
+[info] using task orders [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+libero_10:
+- Number of tasks: 10
+[info] using task orders [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+libero_goal:
+- Number of tasks: 10
+[info] using task orders [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+libero_spatial:
+- Number of tasks: 10
+[info] using task orders [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+libero_object:
+- Number of tasks: 10
+
+Task list created: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/tasks.txt
+Total tasks: 40
+
+Starting evaluation (Hydra manager)...
+task: libero_uncond_2cam224_1e-4
+Checkpoint: ./checkpoints/fastwam_release/libero_uncond_2cam224.pt
+Number of GPUs: 1
+Trials per task: 50
+Max tasks per GPU: 4
+Output directory: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237
+Forwarded overrides: EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
+Evaluation script failed with return code: 2
+Failed subtask list: evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/failed_tasks.txt
+2026-04-12 05:02:49,libero_10,0,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task0_gpu0.log
+2026-04-12 05:02:49,libero_10,1,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task1_gpu0.log
+2026-04-12 05:02:49,libero_10,2,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task2_gpu0.log
+2026-04-12 05:02:49,libero_10,3,gpu=0,rc=1,log=evaluate_results/libero/libero_uncond_2cam224_1e-4/20260412_050237/task_logs/libero_10_task3_gpu0.log
+

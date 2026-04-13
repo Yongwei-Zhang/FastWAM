@@ -25,6 +25,8 @@ video_dit_config:
   seperated_timestep: true
   require_clip_embedding: false
   require_vae_embedding: false
+  # 默认为 True，build_inputs（fastwam.py中函数） 里 first_frame_latents = input_latents[:,:,0:1]；训练 training_loss 里 latents[:,:,0:1] 被换成干净首帧
+  # pre_dit 走 seperated_timestep + fuse 分支（首帧 token 的【扩散步】嵌入为 0）；视频 loss 对 pred_video/target_video 做 [:,:,1:]，不监督首帧。
   fuse_vae_embedding_in_latents: true
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
   video_attention_mask_mode: "first_frame_causal" # default

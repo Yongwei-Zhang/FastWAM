@@ -227,6 +227,7 @@ class Wan22Core(torch.nn.Module):
             "action": action,
         }
 
+    # trainer.py 中会调用，这里是 Wan22Core
     def training_loss(self, sample, tiled=False):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]

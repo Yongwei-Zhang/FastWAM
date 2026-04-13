@@ -18,6 +18,7 @@ EVALUATION:
   policy_name: fastwam_policy
   task_name: null
   task_config: demo_randomized
+  # 决定：每个 episode 里给策略的文本指令从哪一类候选句子里随机抽。设置 unseen 用来测指令泛化
   instruction_type: unseen
   eval_num_episodes: 100
   output_dir: ./evaluate_results/robotwin/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
@@ -32,6 +33,7 @@ EVALUATION:
   rand_device: cpu
   tiled: false
   timing_enabled: false
+  # 评测更快，但保存的帧率会低
   skip_get_obs_within_replan: true
 
   # Runtime inputs
@@ -42,6 +44,8 @@ MULTIRUN:
   enabled: false
   num_gpus: 8
   max_tasks_per_gpu: 2
+  # Libero 多套件评测见 sim_libero.yaml；RoboTwin 入口当前未读此字段。
+  task_suite_names: []
 
 hydra:
   job:

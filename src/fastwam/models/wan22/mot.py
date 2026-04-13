@@ -139,6 +139,12 @@ class MoT(nn.Module):
         torch.Tensor,
         bool,
     ]:
+        """
+        1、用 _split_modulation(block, t_mod) 得到 MSA/MLP 的 shift、scale、gate。
+        2、modulate(norm1(x), shift_msa, scale_msa) 得到自注意力输入，再 q/k/v 投影与 norm_q/norm_k。
+        3、对 q、k 施加 rope_apply(freqs)。
+        4、返回 q,k,v、未改的 x 作 residual_x、以及 gate_msa 与 MLP 三调制量 和 checkpoint 标志，供后面 拼接混合注意力 与 _apply_expert_post_block 使用。
+        """
         """Build per-expert attention tensors and post-block states.
 
         Args:
@@ -444,6 +450,7 @@ class MoT(nn.Module):
             )
         return x
 
+    # self.mot() 调用时的函数
     def forward(
         self,
         embeds_all: Dict[str, torch.Tensor],
@@ -467,44 +474,49 @@ class MoT(nn.Module):
         if attention_mask.shape[0] != attention_mask.shape[1]:
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
-        tokens_all = {k: v for k, v in embeds_all.items()}
+        # 为各专家（video、action expert）token建立逐层更新的工作副本，避免写回时改动入参 embeds_all。
+        tokens_all = {k: v for k, v in embeds_all.items()}  # 新建 dict，键与张量引用同 embeds_all
 
-        for layer_idx in range(self.num_layers):
-            q_chunks = []
-            k_chunks = []
-            v_chunks = []
-            cached = {}
-            seq_lens = []
+        # MoT 逐层：各路先算 Q/K/V 并缓存 post 参数，再拼接做混合注意力，再按长度切回并写回各专家 token。
+        # mot 按层循环，mot 发生在每一层。2 个 expert 共享层号，先各算本层 Q/K/V，序列维拼接后做一次联合注意力，再拆开做各自 后半段（post），然后进入 下一层
+        for layer_idx in range(self.num_layers):  # 遍历当前堆叠层索引
+            q_chunks = []  # 本层各专家 Q 列表
+            k_chunks = []  # 本层各专家 K 列表
+            v_chunks = []  # 本层各专家 V 列表
+            cached = {}  # 各专家该层 block 与调制量，供 attention 后 post 使用
+            seq_lens = []  # 各专家序列长度，供 mixed 切分
 
-            for name in self.expert_order:
-                expert = self.mixtures[name]
-                block = expert.blocks[layer_idx]
-                x = tokens_all[name]
-                freqs = freqs_all[name]
-                t_mod = t_mod_all[name]
+            # 按 expert_order 依次取该层 block，用当前 token 与 RoPE、时间调制构造注意力输入。
+            for name in self.expert_order:  # 2 个 name：video 和 action
+                expert = self.mixtures[name]  # 名为 name 的专家子模块，按 name 对应的整条专家 DiT
+                block = expert.blocks[layer_idx]  # 该专家第 layer_idx 个 DiT block
+                x = tokens_all[name]  # 该专家本层输入隐状态，[B, S, D]，其中 S 为 S_v 或者 S_a
+                freqs = freqs_all[name]  # 该专家 RoPE 频率表，作用在 Q/K 上，提供位置编码
+                t_mod = t_mod_all[name]  # 该专家时间步调制向量，与 block.modulation 相加后拆成 shift/scale/gate。用于 AdaLN 式调制：norm1 后自注意力支路、以及 norm2 后 MLP
 
                 (
-                    q,
+                    q,  # [B, S, H*Dh]，S 表示该路的 token 数，H 是头数，Dh 表示每个头的维度
                     k,
                     v,
-                    residual_x,
-                    gate_msa,
-                    shift_mlp,
+                    residual_x,  # 进入该 block 的 x 原样保留，[B, S, D]
+                    gate_msa,  # 多头自注意力门控，对子层输出做逐维加权再加回，存储的是权重，不是“做不做”的 bool 变量
+                    shift_mlp,  # MLP 前对 norm2 做 modulate(..., shift, scale) 的平移/缩放
                     scale_mlp,
-                    gate_mlp,
-                    use_gradient_checkpointing,
+                    gate_mlp,  # 同样一套：x + gate * residual，用在 Block 中 MLP 那一个子层
+                    use_gradient_checkpointing,  # 是否对该 expert 在「混合注意力之后」的那段 post（投影 o + gate + 可选 cross-attn + MLP）做梯度检查点
                 ) = self._build_expert_attention_io(
                     expert=expert,
                     block=block,
                     x=x,
                     freqs=freqs,
                     t_mod=t_mod,
-                )
+                )  # 投影得 Q/K/V，并拆出残差与 AdaLN 等供后续使用
 
-                q_chunks.append(q)
-                k_chunks.append(k)
-                v_chunks.append(v)
-                seq_lens.append(x.shape[1])
+                q_chunks.append(q)  # 追加该专家 Q
+                k_chunks.append(k)  # 追加该专家 K
+                v_chunks.append(v)  # 追加该专家 V
+                seq_lens.append(x.shape[1])  # 记录该路 token 数
+                # cached：把「混合注意力之前已算好、但要等混合完才能用」的 per-expert 状态存起来，供切分 mixed 后做 post
                 cached[name] = {
                     "block": block,
                     "residual_x": residual_x,
@@ -512,31 +524,35 @@ class MoT(nn.Module):
                     "shift_mlp": shift_mlp,
                     "scale_mlp": scale_mlp,
                     "gate_mlp": gate_mlp,
-                    "use_gradient_checkpointing": use_gradient_checkpointing,
-                }
+                    "use_gradient_checkpointing": use_gradient_checkpointing,  # 如果为 True，则少存中间激活、省显存
+                }  # 缓存 post 与 checkpoint 开关
 
-            # 3. concat all tokens for mixed attention
-            q_cat = torch.cat(q_chunks, dim=1)
-            k_cat = torch.cat(k_chunks, dim=1)
-            v_cat = torch.cat(v_chunks, dim=1)
+            # 在序列维拼接各路 Q/K/V，总长度与 attention_mask 行/列一致。
+            q_cat = torch.cat(q_chunks, dim=1)  # [B, S_v+S_a, H*Dh]，与传入的 attention_mask 的维度对应：[S_v + S_a, S_v + S_a]
+            k_cat = torch.cat(k_chunks, dim=1)  # 同上
+            v_cat = torch.cat(v_chunks, dim=1)  # 同上
 
-            total_seq = q_cat.shape[1]
-            if attention_mask.shape[0] != total_seq:
+            total_seq = q_cat.shape[1]  # 拼接后序列总长
+            if attention_mask.shape[0] != total_seq:  # 掩码边长须等于总长
                 raise ValueError(
                     "Attention mask seq length mismatch: "
                     f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
-                )
+                )  # 不一致则无法对齐注意力
 
-            mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
+            # 对 q_cat, k_cat, v_cat 调 flash_attention，在总长 S_v+S_a 上做一次注意力
+            # 符号 o：SelfAttention 里的 输出线性层 block.self_attn.o，把 注意力输出 [B,S,H*Dh] 投回 隐空间维度 [B,S,D]
+            # gate_msa：由 t_mod + block.modulation 拆出的 第 3 个量，喂给 GateModule：x = residual_x + gate_msa * branch_out，控制自注意力分支加多少到残差上（msa：多头自注意力）
+            mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)  # 单次混合自注意力输出
 
-            start = 0
+            start = 0  # mixed 上切片起点
+            # 按 expert_order 与 seq_lens 切回各段，再过各专家 post（gate + 可选的cross + MLP）。
             for name, seq_len in zip(self.expert_order, seq_lens):
-                # 4. split mixed attention output and apply post-attention blocks for each expert
-                end = start + seq_len
-                mixed_slice = mixed[:, start:end, :]
-                cached_expert = cached[name]
-                block = cached_expert["block"]
-                context_payload = context_all.get(name)
+                end = start + seq_len  # 当前专家段终点
+                mixed_slice = mixed[:, start:end, :]  # 该专家对应的 mixed 子序列
+                cached_expert = cached[name]  # 取该专家本层缓存
+                block = cached_expert["block"]  # 当前 DiT block
+                # 如果传入了参数context_all，那么就需要在 post 里做 cross-attn
+                context_payload = context_all.get(name)  # context_all 里 expert 对应的可选字典，给 cross-attention 用。context 是条件序列，用作K/V，形状一般为 [B, L, D]
 
                 updated_tokens = self._apply_post_with_optional_checkpoint(
                     block=block,
@@ -548,9 +564,9 @@ class MoT(nn.Module):
                     use_gradient_checkpointing=cached_expert["use_gradient_checkpointing"],
                     mixed_slice=mixed_slice,
                     context_payload=context_payload,
-                )
+                )  # 得到该专家更新后的 token
 
-                tokens_all[name] = updated_tokens
-                start = end
+                tokens_all[name] = updated_tokens  # 写回，供下一层或返回
+                start = end  # 下一路专家从 end 起切
 
         return tokens_all

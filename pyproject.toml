@@ -40,6 +40,7 @@ dependencies = [
   "wandb==0.23.1",
 ]
 
+# 显式说明了包的根目录为 src
 [tool.setuptools.package-dir]
 "" = "src"
 

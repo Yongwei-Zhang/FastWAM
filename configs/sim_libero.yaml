@@ -21,7 +21,8 @@ EVALUATION:
 
   # Runtime behavior
   env_num: 1
-  num_steps_wait: 30
+  # 减少每episode开头的空转仿真步数
+  num_steps_wait: 10
   replan_steps: 10
   binarize_gripper: true
   use_action_ensembler: false
@@ -49,7 +50,7 @@ MULTIRUN:
     - libero_spatial
     - libero_object
   num_gpus: 8
-  max_tasks_per_gpu: 2
+  max_tasks_per_gpu: 4
 
 hydra:
   job:

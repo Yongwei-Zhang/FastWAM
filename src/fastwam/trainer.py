@@ -47,6 +47,7 @@ class Wan22Trainer:
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
         
+        # 当配置 mixed_precision=fp16 或 bf16 时：前向中很多算子会自动用 fp16/bf16 跑（通常更快、更省显存），必要的部分仍保持更高精度
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
         if self.mixed_precision not in {"no", "fp16", "bf16"}:
@@ -644,6 +645,7 @@ class Wan22Trainer:
         )
 
     def train(self):
+        # 主训练：以 global_step（优化器步）为进度，直到达到 cfg 中的 max_steps。
         self._set_dit_only_train_mode()
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -652,67 +654,78 @@ class Wan22Trainer:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
+        # self.train_loader 的 Python 迭代器，每次从当前 epoch 中取出下一个 batch，驱动主循环一步步训练
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
 
         while self.global_step < self.max_steps:
             try:
+                # 从当前 epoch 的迭代器里取下一个 batch。成功则 batch_in_epoch 加一，表示本 epoch 里又走了一个 batch
+                # 一个 epoch 指的是把训练集（更准确说：train_loader 代表的那一轮数据）完整遍历一遍，从第一个 batch 读到耗尽触发 StopIteration
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
             except StopIteration:
                 self.epoch += 1
                 self.batch_in_epoch = 0
+                # 分布式/断点续训时，sampler 里可能记着 “从第几个 batch 接着读” ；一轮扫完后要清掉偏移，下一轮从数据开头正常采样。
                 self.train_sampler.clear_resume_batch_offset()
-                data_iter = iter(self.train_loader)
+                data_iter = iter(self.train_loader)  # 一个 epoch 之后再创建一个 epoch
                 continue
 
+            # 梯度累积：窗口内多次 backward，仅在 sync_gradients 为 True 时做一次 step。
             with self.accelerator.accumulate(self.model):
+                # self.model 往往是 Accelerate 包了一层的模型（DistributedDataParallel / DeepSpeed 等）；否则拿到的是底层原始模型实例
+                # train_model 最终通常是底层模型类的实例：项目里常见的是 FastWAM / FastWAMJoint / FastWAMIDM（或视频基线 Wan22Core），取决于你当前 task/model 配置
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
-                with self.accelerator.autocast():
+                # 混合精度自动类型转换上下文
+                with self.accelerator.autocast(): 
+                    # src/fastwam/models/wan22/fastwam.py 中给出 training_loss
                     loss, loss_dict = train_model.training_loss(sample)
-                self.accelerator.backward(loss)
+                # 对当前 micro-batch 的 loss 反向传播；在 accumulate 窗口内梯度累加，直至 sync_gradients 再 step。
+                self.accelerator.backward(loss)  # Accelerate 统一处理混合精度与分布式梯度
 
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    if not self.accelerator.optimizer_step_was_skipped:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.global_step += 1
+                    # 梯度已同步：执行一次优化步；聚合跨卡标量；主进程写训练日志与 wandb；按间隔 eval、存盘；达 max_steps 则收尾退出。
+                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)  # 全局范数裁剪
+                    self.optimizer.step()  # 参数更新
+                    if not self.accelerator.optimizer_step_was_skipped:  # 本步未因 inf/nan 等被跳过时
+                        self.scheduler.step()  # 推进学习率
+                    self.optimizer.zero_grad(set_to_none=True)  # 释放梯度缓冲
+                    self.global_step += 1  # 全局步进
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
-                    )
-                    global_loss_metrics = {}
-                    for key, value in loss_dict.items():
-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
+                    )  # 各卡 loss 均值，与卡数无关
+                    global_loss_metrics = {}  # 分项聚合结果
+                    for key, value in loss_dict.items():  # 逐项汇总
+                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)  # 标量张量化便于 gather
                         global_loss_metrics[key] = float(
                             self.accelerator.gather(metric_tensor).mean().item()
-                        )
-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                        )  # 该项跨卡均值
+                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)  # 与 gather 设备 dtype 对齐
+                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())  # 梯度范数跨卡均值
 
-                    current_lr = float(self.optimizer.param_groups[0]["lr"])
+                    current_lr = float(self.optimizer.param_groups[0]["lr"])  # 当前组学习率
 
-                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
-                        eta_str, steps_per_sec = self._estimate_eta()
+                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:  # 按间隔且仅主进程
+                        eta_str, steps_per_sec = self._estimate_eta()  # 预估剩余时间与吞吐
                         description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
                             self.epoch,
                             self.global_step,
                             self.max_steps,
                             global_loss,
-                        )
-                        if global_loss_metrics:
+                        )  # 日志前缀
+                        if global_loss_metrics:  # 有分项则拼接
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
-                            description += detail_str + " "
+                            description += detail_str + " "  # 追加分项字符串
                         description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
                             current_lr,
                             steps_per_sec,
                             steps_per_sec * self.batch_size * self.accelerator.num_processes,
                             eta_str,
-                        )
-                        logger.info(description)
+                        )  # 追加 lr、步速、样本速、ETA
+                        logger.info(description)  # 控制台
 
                         wandb_payload = {
                             "train/loss": global_loss,
@@ -720,26 +733,26 @@ class Wan22Trainer:
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
-                        }
-                        for key, value in global_loss_metrics.items():
+                        }  # 训练曲线所需标量
+                        for key, value in global_loss_metrics.items():  # 分项写入同名键
                             wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
+                        self._wandb_log(wandb_payload)  # 上传 wandb
 
                     if (
                         self.eval_every > 0
                         and self.val_dataset is not None
                         and self.global_step % self.eval_every == 0
-                    ):
-                        metrics = self.evaluate()
-                        self.accelerator.wait_for_everyone()
-                        if metrics is not None and self.accelerator.is_main_process:
+                    ):  # 到达验证间隔且已配置验证集
+                        metrics = self.evaluate()  # 验证前向
+                        self.accelerator.wait_for_everyone()  # 全进程同步，避免后续步错乱
+                        if metrics is not None and self.accelerator.is_main_process:  # 主进程打 eval 日志
                             description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
                                 self.global_step,
                                 metrics["val_loss"],
                                 metrics["psnr_rd"],
                                 metrics["ssim_rd"],
-                            )
-                            if "action_l2" in metrics:
+                            )  # 验证摘要
+                            if "action_l2" in metrics:  # 若模型返回 action 误差
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
@@ -752,16 +765,16 @@ class Wan22Trainer:
                                 "eval/ssim_rd": float(metrics["ssim_rd"]),
                                 "eval/psnr_dg": float(metrics["psnr_dg"]),
                                 "eval/ssim_dg": float(metrics["ssim_dg"]),
-                            }
+                            }  # 各组 PSNR/SSIM
                             if "action_l2" in metrics:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            self._wandb_log(eval_payload)
+                            self._wandb_log(eval_payload)  # 上传验证指标
 
-                    if self.save_every > 0 and self.global_step % self.save_every == 0:
-                        ckpt_info = self.save_checkpoint()
-                        if self.accelerator.is_main_process:
+                    if self.save_every > 0 and self.global_step % self.save_every == 0:  # 周期性 checkpoint
+                        ckpt_info = self.save_checkpoint()  # 权重与 accelerate 状态
+                        if self.accelerator.is_main_process:  # 仅主进程打印路径
                             logger.info(
                                 "[ckpt] step=%d weights=%s state=%s",
                                 self.global_step,
@@ -769,8 +782,8 @@ class Wan22Trainer:
                                 ckpt_info["state_path"],
                             )
 
-                    if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
+                    if self.global_step >= self.max_steps:  # 本步已达训练步上限
+                        ckpt_info = self.save_checkpoint()  # 最终再存一次
                         if self.accelerator.is_main_process:
                             logger.info(
                                 "[done] max_steps reached step=%d weights=%s state=%s",
@@ -778,8 +791,9 @@ class Wan22Trainer:
                                 ckpt_info["weights_path"],
                                 ckpt_info["state_path"],
                             )
-                        return
+                        return  # 结束 train 内层循环与外层 epoch 循环
 
+        # 进入循环前 global_step 已 >= max_steps（例如 resume 时步数已满）时走到此处，再存一次并退出。
         ckpt_info = self.save_checkpoint()
         if self.accelerator.is_main_process:
             logger.info(

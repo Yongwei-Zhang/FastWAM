@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
@@ -367,14 +368,13 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    prompt_cache: Optional[dict] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
     else:
         num_inference_steps = int(num_inference_steps_cfg)
-    prompt_template = DEFAULT_PROMPT
-    prompt = prompt_template.format(task=task_description)
 
     image, proprio, imgs = _obs_to_model_input(
         obs,
@@ -386,23 +386,46 @@ def _predict_action_chunk(
         dtype=model.torch_dtype,
     )
 
-    infer_kwargs = {
-        "prompt": prompt,
-        "input_image": image,
-        "action_horizon": action_horizon,
-        "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
-        "text_cfg_scale": float(cfg.EVALUATION.get("text_cfg_scale", 1.0)),
-        "num_inference_steps": num_inference_steps,
-        "proprio": proprio,
-        "sigma_shift": (
-            None
-            if cfg.EVALUATION.get("sigma_shift") is None
-            else float(cfg.EVALUATION.get("sigma_shift"))
-        ),
-        "seed": None if cfg.get("seed") is None else int(cfg.seed),
-        "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
-        "tiled": bool(cfg.EVALUATION.get("tiled", False)),
-    }
+    if prompt_cache is not None:
+        infer_kwargs = {
+            "prompt": None,
+            "context": prompt_cache["context"],
+            "context_mask": prompt_cache["context_mask"],
+            "input_image": image,
+            "action_horizon": action_horizon,
+            "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
+            "text_cfg_scale": float(cfg.EVALUATION.get("text_cfg_scale", 1.0)),
+            "num_inference_steps": num_inference_steps,
+            "proprio": proprio,
+            "sigma_shift": (
+                None
+                if cfg.EVALUATION.get("sigma_shift") is None
+                else float(cfg.EVALUATION.get("sigma_shift"))
+            ),
+            "seed": None if cfg.get("seed") is None else int(cfg.seed),
+            "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
+            "tiled": bool(cfg.EVALUATION.get("tiled", False)),
+        }
+    else:
+        prompt_template = DEFAULT_PROMPT
+        prompt = prompt_template.format(task=task_description)
+        infer_kwargs = {
+            "prompt": prompt,
+            "input_image": image,
+            "action_horizon": action_horizon,
+            "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
+            "text_cfg_scale": float(cfg.EVALUATION.get("text_cfg_scale", 1.0)),
+            "num_inference_steps": num_inference_steps,
+            "proprio": proprio,
+            "sigma_shift": (
+                None
+                if cfg.EVALUATION.get("sigma_shift") is None
+                else float(cfg.EVALUATION.get("sigma_shift"))
+            ),
+            "seed": None if cfg.get("seed") is None else int(cfg.seed),
+            "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
+            "tiled": bool(cfg.EVALUATION.get("tiled", False)),
+        }
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -455,6 +478,7 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    prompt_cache: Optional[dict] = None,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
@@ -498,6 +522,7 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                prompt_cache=prompt_cache,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -597,6 +622,15 @@ def run_single_task(
 ) -> dict:
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+
+    # 每个task只调用一次text encoder，后续replan直接传 context/context_mask
+    # Pre-compute text encoder output to avoid redundant encode_prompt() calls per replan
+    prompt_cache = None
+    if hasattr(model, "encode_prompt") and hasattr(model, "text_encoder") and model.text_encoder is not None:
+        prompt = DEFAULT_PROMPT.format(task=task_description)
+        with torch.no_grad():
+            context, context_mask = model.encode_prompt(prompt)
+        prompt_cache = {"context": context, "context_mask": context_mask}
     results = {
         "successes": 0,
         "failure_episodes": [],
@@ -606,6 +640,9 @@ def run_single_task(
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
+
+    video_executor = ThreadPoolExecutor(max_workers=2)
+    video_futures = []
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
         success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
@@ -620,6 +657,7 @@ def run_single_task(
             input_w=input_w,
             input_h=input_h,
             model_device=model_device,
+            prompt_cache=prompt_cache,
         )
         if success:
             results["successes"] += 1
@@ -629,13 +667,14 @@ def run_single_task(
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
-        save_rollout_video(
+        video_futures.append(video_executor.submit(
+            save_rollout_video,
             video_dir,
             replay_images,
             f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
             success=success,
             task_description=task_description,
-        )
+        ))
         if visualize_future_video:
             if len(predicted_future_video_clips) == 0:
                 logging.warning(
@@ -649,7 +688,8 @@ def run_single_task(
                 for clip in predicted_future_video_clips:
                     all_gt_frames.extend(clip["gt_frames"])
                     all_pred_frames.extend(clip["pred_frames"])
-                    save_prediction_video(
+                    video_futures.append(video_executor.submit(
+                        save_prediction_video,
                         predicted_video_dir,
                         clip["gt_frames"],
                         clip["pred_frames"],
@@ -657,8 +697,9 @@ def run_single_task(
                         clip["replan_idx"],
                         success=success,
                         task_description=task_description,
-                    )
-                save_prediction_video(
+                    ))
+                video_futures.append(video_executor.submit(
+                    save_prediction_video,
                     predicted_video_dir,
                     all_gt_frames,
                     all_pred_frames,
@@ -666,7 +707,13 @@ def run_single_task(
                     "all",
                     success=success,
                     task_description=task_description,
-                )
+                ))
+
+    # 视频保存改为异步，不阻塞下一个 trail
+    # Wait for all async video saves to finish
+    for fut in video_futures:
+        fut.result()
+    video_executor.shutdown(wait=False)
 
     if visualize_future_video:
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
