@@ -25,6 +25,7 @@ train:
       # - key: observation.state
         raw_shape: 8 # before transform
         shape: 8 # after transform
+  # 数据配置中的"原始采样窗口长度"
   num_frames: 33
   global_sample_stride: 1
   action_video_freq_ratio: 4 # 32 action, 9 video frames

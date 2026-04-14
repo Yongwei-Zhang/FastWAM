@@ -8,6 +8,7 @@ redirect_common_files: true
 mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
+# 如果当前数据设置 num_frames=9（3 latent frames），则num_anchor_frames 至多为2（保留1帧用于去噪）
 num_anchor_frames: 1
 
 video_dit_config:

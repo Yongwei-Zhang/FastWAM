@@ -981,6 +981,9 @@ class VideoVAE_(nn.Module):
         return x_recon, mu, log_var
 
     def encode(self, x, scale):
+        """
+        VAE 编码逻辑：第一帧单独编码产生 1 个 latent，之后每 4 帧产生 1 个 latent。
+        """
         self.clear_cache()
         ## cache
         t = x.shape[2]
