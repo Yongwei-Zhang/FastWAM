@@ -19,14 +19,19 @@ export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 # Default evaluation config
 # =========================
 TASK="libero_uncond_2cam224_1e-4"
-CKPT="./checkpoints/fastwam_release/libero_uncond_2cam224.pt"
-DATASET_STATS_PATH="./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json"
+
+# 给出的模型权重；动作/观测归一化统计
+# CKPT="./checkpoints/fastwam_release/libero_uncond_2cam224.pt"
+# DATASET_STATS_PATH="./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json"
+
+# （切换到根目录执行）评测自己训练的模型，DATASET_STATS_PATH 必须和该次训练用的统计一致
+CKPT="./runs/libero_uncond_2cam224_1e-4/2026-04-09_08-25-37/checkpoints/weights/step_020000.pt"
+DATASET_STATS_PATH="./runs/libero_uncond_2cam224_1e-4/2026-04-09_08-25-37/dataset_stats.json"
 
 ########################################
 # 脚本评估参数
-
 # configs/sim_libero.yaml 中关于 MULTIRUN 的设置
-NUM_GPUS="1"  # 参数设置，等号2边不能有空格
+NUM_GPUS="4"  # 参数设置，等号2边不能有空格
 # Optional: specify visible GPUs directly here (e.g. "0,2,5").
 # Leave empty to use NUM_GPUS scheduling (0..NUM_GPUS-1).
 # GPU_IDS="0,1,2,3"

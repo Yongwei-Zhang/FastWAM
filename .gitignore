@@ -14,6 +14,7 @@ evaluate_results/
 # ai coding
 .codex/
 .claude/
+.cursor/
 
 # Data types
 *.jit
