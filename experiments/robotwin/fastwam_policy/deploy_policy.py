@@ -184,6 +184,10 @@ class WorldActionRobotWinPolicy:
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
+        # Multi-anchor frame history buffer
+        self._num_anchor_frames = getattr(self.model, "num_anchor_frames", 1)
+        self._frame_history: deque[torch.Tensor] = deque(maxlen=self._num_anchor_frames)
+
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
             checkpoint_path,
@@ -235,13 +239,22 @@ class WorldActionRobotWinPolicy:
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
+
+        # Update frame history
+        self._frame_history.append(image_tensor)
+        while len(self._frame_history) < self._num_anchor_frames:
+            self._frame_history.appendleft(self._frame_history[0])
+
+        # Use frame history list for multi-anchor, single tensor otherwise
+        input_image_arg = list(self._frame_history) if self._num_anchor_frames > 1 else image_tensor
+
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
         infer_kwargs = {
             "prompt": prompt,
-            "input_image": image_tensor,
+            "input_image": input_image_arg,
             "action_horizon": self.action_horizon,
             "proprio": proprio,
             "negative_prompt": self.negative_prompt,
@@ -274,6 +287,11 @@ class WorldActionRobotWinPolicy:
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        # Update frame history every step for multi-anchor (even when not replanning)
+        if self._num_anchor_frames > 1 and observation is not None and self.pending_actions:
+            image_tensor = self._build_robotwin_image_tensor(observation)
+            self._frame_history.append(image_tensor)
+
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -306,6 +324,7 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        self._frame_history.clear()
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()

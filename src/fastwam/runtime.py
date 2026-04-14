@@ -96,6 +96,7 @@ def create_fastwam(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    num_anchor_frames: int = 1,
 ):
     # FastWAM：视频+动作头、扩散调度与 loss 权重均来自 cfg
     from .models.wan22.fastwam import FastWAM
@@ -165,6 +166,7 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        num_anchor_frames=int(num_anchor_frames),
     )
 
 
@@ -185,6 +187,7 @@ def create_fastwam_joint(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    num_anchor_frames: int = 1,
 ):
     # 联合视频-动作变体（cfg 形态同 create_fastwam，实现类不同）
     from .models.wan22.fastwam_joint import FastWAMJoint
@@ -251,6 +254,7 @@ def create_fastwam_joint(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        num_anchor_frames=int(num_anchor_frames),
     )
 
 
@@ -271,6 +275,7 @@ def create_fastwam_idm(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    num_anchor_frames: int = 1,
 ):
     # FastWAM 的反动力学（IDM）变体，结构随任务配置而异
     from .models.wan22.fastwam_idm import (
@@ -339,6 +344,7 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        num_anchor_frames=int(num_anchor_frames),
     )
 
 

@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 
@@ -32,6 +32,7 @@ class FastWAMJoint(FastWAM):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        num_anchor_frames: int = 1,
     ) -> torch.Tensor:
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
@@ -41,6 +42,7 @@ class FastWAMJoint(FastWAM):
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
             device=device,
+            num_anchor_frames=num_anchor_frames,
         )
         # action -> action
         mask[video_seq_len:, video_seq_len:] = True
@@ -96,7 +98,7 @@ class FastWAMJoint(FastWAM):
     def infer_action(
         self,
         prompt: Optional[str],
-        input_image: torch.Tensor,
+        input_image: Union[torch.Tensor, list[torch.Tensor]],
         action_horizon: int,
         num_video_frames: int,
         proprio: Optional[torch.Tensor] = None,
@@ -112,13 +114,19 @@ class FastWAMJoint(FastWAM):
     ) -> dict[str, Any]:
         self.eval()
 
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
-            raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
-            )
-        _, _, height, width = input_image.shape
+        if isinstance(input_image, list):
+            for i, img in enumerate(input_image):
+                if img.ndim == 3:
+                    input_image[i] = img.unsqueeze(0)
+            _, _, height, width = input_image[0].shape
+        else:
+            if input_image.ndim == 3:
+                input_image = input_image.unsqueeze(0)
+            if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
         if (checked_h, checked_w) != (height, width):
             raise ValueError(
@@ -161,9 +169,14 @@ class FastWAMJoint(FastWAM):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        if isinstance(input_image, list):
+            input_image = [img.to(device=self.device, dtype=self.torch_dtype) for img in input_image]
+            anchor_latents = self._encode_multi_image_latents_tensor(input_image, tiled=tiled)
+        else:
+            input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+            anchor_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        n_anchor = anchor_latents.shape[2]
+        latents_video[:, :, 0:n_anchor] = anchor_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -229,7 +242,7 @@ class FastWAMJoint(FastWAM):
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            latents_video[:, :, 0:n_anchor] = anchor_latents.clone()
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),

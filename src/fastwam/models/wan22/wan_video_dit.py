@@ -475,6 +475,7 @@ class WanVideoDiT(torch.nn.Module):
         video_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        num_anchor_frames: int = 1,
     ) -> torch.Tensor:
         if video_seq_len <= 0:
             raise ValueError(f"`video_seq_len` must be positive, got {video_seq_len}")
@@ -500,8 +501,8 @@ class WanVideoDiT(torch.nn.Module):
 
         if self.video_attention_mask_mode == "first_frame_causal":
             video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-            video_mask[:first_frame_tokens, first_frame_tokens:] = False
+            anchor_tokens = min(num_anchor_frames * video_tokens_per_frame, video_seq_len)
+            video_mask[:anchor_tokens, anchor_tokens:] = False
             return video_mask
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
@@ -515,6 +516,7 @@ class WanVideoDiT(torch.nn.Module):
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
         control_camera_latents_input: Optional[torch.Tensor] = None,
+        num_anchor_frames: int = 1,
     ) -> Dict[str, Any]:
         x, timestep, context_mask = self._validate_forward_inputs(
             x=x,
@@ -543,7 +545,7 @@ class WanVideoDiT(torch.nn.Module):
                 dtype=timestep.dtype,
                 device=timestep.device,
             ) * timestep.view(batch_size, 1, 1)
-            token_timesteps[:, 0, :] = 0
+            token_timesteps[:, 0:num_anchor_frames, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
             token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
             t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
@@ -566,10 +568,10 @@ class WanVideoDiT(torch.nn.Module):
             context = torch.cat([context, action_emb], dim=1) # (B, context_len + action_len, dim)
 
             # new mask
-            num_temporal_groups = f - 1 # first latent frame do not attend to actions
+            num_temporal_groups = f - num_anchor_frames # anchor latent frames do not attend to actions
             if num_temporal_groups <= 0:
                 raise ValueError(
-                    "Action-conditioned context mask requires at least 2 latent frames when `action` is provided."
+                    f"Action-conditioned context mask requires at least {num_anchor_frames + 1} latent frames when `action` is provided."
                 )
             assert action_emb.shape[1] % num_temporal_groups == 0, \
                 f"Action embedding length {action_emb.shape[1]} must be divisible by number of temporal groups {num_temporal_groups}"
@@ -585,8 +587,9 @@ class WanVideoDiT(torch.nn.Module):
             final_context_mask = torch.zeros((batch_size, seq_len, context.shape[1]), dtype=torch.bool, device=context.device) # (B, seq_len, L + action_len)
             # all latent frames attend to text tokens
             final_context_mask[:, :, :context_len] = context_mask.unsqueeze(1).expand(-1, seq_len, -1) # (B, seq_len, L)
-            # latent frames from the 2nd one attend to action tokens
-            final_context_mask[:, tokens_per_frame:, context_len:] = action_group_mask.unsqueeze(0).expand(batch_size, -1, -1) # (B, seq_len, action_len)
+            # latent frames from the (num_anchor_frames+1)-th one attend to action tokens
+            anchor_total_tokens = num_anchor_frames * tokens_per_frame
+            final_context_mask[:, anchor_total_tokens:, context_len:] = action_group_mask.unsqueeze(0).expand(batch_size, -1, -1) # (B, seq_len, action_len)
             context_mask = final_context_mask
         elif self.action_conditioned and action is None:
             if f != 1:
@@ -633,6 +636,7 @@ class WanVideoDiT(torch.nn.Module):
         context_mask: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
+        num_anchor_frames: int = 1,
     ):
         pre_state = self.pre_dit(
             x=x,
@@ -641,6 +645,7 @@ class WanVideoDiT(torch.nn.Module):
             context_mask=context_mask,
             action=action,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            num_anchor_frames=num_anchor_frames,
         )
         x_tokens = pre_state["tokens"]
         context_emb = pre_state["context"]
@@ -651,6 +656,7 @@ class WanVideoDiT(torch.nn.Module):
             video_seq_len=x_tokens.shape[1],
             video_tokens_per_frame=int(pre_state["meta"]["tokens_per_frame"]),
             device=x_tokens.device,
+            num_anchor_frames=num_anchor_frames,
         ) if self.video_attention_mask_mode != "bidirectional" else None # special rule for faster speed
 
         for block in self.blocks:

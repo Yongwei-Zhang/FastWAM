@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
@@ -369,6 +370,7 @@ def _predict_action_chunk(
     input_h: int,
     model_device: str,
     prompt_cache: Optional[dict] = None,
+    frame_history: Optional[list] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -386,12 +388,17 @@ def _predict_action_chunk(
         dtype=model.torch_dtype,
     )
 
+    # Use frame history if available (multi-anchor support)
+    input_image_arg = image
+    if frame_history is not None and len(frame_history) > 1:
+        input_image_arg = list(frame_history)
+
     if prompt_cache is not None:
         infer_kwargs = {
             "prompt": None,
             "context": prompt_cache["context"],
             "context_mask": prompt_cache["context_mask"],
-            "input_image": image,
+            "input_image": input_image_arg,
             "action_horizon": action_horizon,
             "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
             "text_cfg_scale": float(cfg.EVALUATION.get("text_cfg_scale", 1.0)),
@@ -411,7 +418,7 @@ def _predict_action_chunk(
         prompt = prompt_template.format(task=task_description)
         infer_kwargs = {
             "prompt": prompt,
-            "input_image": image,
+            "input_image": input_image_arg,
             "action_horizon": action_horizon,
             "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
             "text_cfg_scale": float(cfg.EVALUATION.get("text_cfg_scale", 1.0)),
@@ -493,6 +500,10 @@ def run_single_episode(
         ensembler = ActionEnsembler()
         ensembler.reset()
 
+    # Multi-anchor frame history buffer
+    num_anchor_frames = getattr(model, "num_anchor_frames", 1)
+    frame_history: deque = deque(maxlen=num_anchor_frames)
+
     replay_images = []
     predicted_future_video_clips: list[dict[str, Any]] = []
     episode_future_clip_psnr: list[float] = []
@@ -512,6 +523,17 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
+            # Update frame history with current observation
+            if num_anchor_frames > 1:
+                cur_image, _, _ = _obs_to_model_input(
+                    obs, cfg=cfg, processor=processor,
+                    width=input_w, height=input_h,
+                    device=model_device, dtype=model.torch_dtype,
+                )
+                frame_history.append(cur_image)
+                while len(frame_history) < num_anchor_frames:
+                    frame_history.appendleft(frame_history[0])
+
             action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
@@ -523,6 +545,7 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
                 prompt_cache=prompt_cache,
+                frame_history=list(frame_history) if num_anchor_frames > 1 else None,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -545,6 +568,15 @@ def run_single_episode(
             replay_images.append(imgs.copy())
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
+
+        # Update frame history every step for multi-anchor
+        if num_anchor_frames > 1:
+            cur_image, _, _ = _obs_to_model_input(
+                obs, cfg=cfg, processor=processor,
+                width=input_w, height=input_h,
+                device=model_device, dtype=model.torch_dtype,
+            )
+            frame_history.append(cur_image)
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:

@@ -38,8 +38,12 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        num_anchor_frames: int = 1,
     ):
         super().__init__()
+        self.num_anchor_frames = int(num_anchor_frames)
+        if self.num_anchor_frames < 1:
+            raise ValueError(f"num_anchor_frames must be >= 1, got {self.num_anchor_frames}")
         self.video_expert = video_expert
         self.action_expert = action_expert
         self.mot = mot
@@ -111,6 +115,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        num_anchor_frames: int = 1,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -169,6 +174,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            num_anchor_frames=num_anchor_frames,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -265,6 +271,21 @@ class FastWAM(torch.nn.Module):
             z = z[0].unsqueeze(0)
         return z
 
+    @torch.no_grad()
+    def _encode_multi_image_latents_tensor(
+        self,
+        input_images: list[torch.Tensor],
+        tiled=False,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+    ) -> torch.Tensor:
+        """Encode N observation frames independently, return [1, C, N, H_lat, W_lat]."""
+        latents = []
+        for img in input_images:
+            z = self._encode_input_image_latents_tensor(img, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            latents.append(z)
+        return torch.cat(latents, dim=2)
+
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
@@ -345,11 +366,15 @@ class FastWAM(torch.nn.Module):
         input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
-        first_frame_latents = None
+        anchor_latents = None
         fuse_flag = False
-        # 仅在 video_expert.fuse_vae_embedding_in_latents == True 时，first_frame_latents 才非空。后面将干净的首帧与加噪的未来帧合并
         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
-            first_frame_latents = input_latents[:, :, 0:1]
+            if self.num_anchor_frames >= input_latents.shape[2]:
+                raise ValueError(
+                    f"num_anchor_frames ({self.num_anchor_frames}) must be < "
+                    f"num_latent_frames ({input_latents.shape[2]})"
+                )
+            anchor_latents = input_latents[:, :, 0:self.num_anchor_frames]
             fuse_flag = True
 
         if context.ndim != 3 or context_mask.ndim != 2:
@@ -367,7 +392,7 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
                 )
-            proprio = proprio[:, 0, :] # [B, D]
+            proprio = proprio[:, self.num_anchor_frames - 1, :] # [B, D]
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -384,7 +409,7 @@ class FastWAM(torch.nn.Module):
             "context": context,
             "context_mask": context_mask,
             "input_latents": input_latents,
-            "first_frame_latents": first_frame_latents,
+            "anchor_latents": anchor_latents,
             "fuse_vae_embedding_in_latents": fuse_flag,
             "action": action,
             "action_is_pad": action_is_pad,
@@ -398,6 +423,7 @@ class FastWAM(torch.nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        num_anchor_frames: int = 1,
     ) -> torch.Tensor:
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
@@ -407,12 +433,13 @@ class FastWAM(torch.nn.Module):
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
             device=device,
+            num_anchor_frames=num_anchor_frames,
         )
         # action -> action
         mask[video_seq_len:, video_seq_len:] = True
-        # action -> first-frame video only
-        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
+        # action -> anchor-frame video tokens only
+        anchor_tokens = min(num_anchor_frames * video_tokens_per_frame, video_seq_len)
+        mask[video_seq_len:, :anchor_tokens] = True
         return mask
 
     def _compute_video_loss_per_sample(
@@ -420,7 +447,7 @@ class FastWAM(torch.nn.Module):
         pred_video: torch.Tensor,
         target_video: torch.Tensor,
         image_is_pad: Optional[torch.Tensor],
-        include_initial_video_step: bool,
+        num_excluded_anchor_steps: int = 0,
     ) -> torch.Tensor:
         video_loss_token = F.mse_loss(pred_video.float(), target_video.float(), reduction="none").mean(dim=(1, 3, 4))
         if image_is_pad is None:
@@ -439,10 +466,8 @@ class FastWAM(torch.nn.Module):
 
         tail_is_pad = image_is_pad[:, 1:]
         latent_tail_is_pad = tail_is_pad.view(image_is_pad.shape[0], -1, temporal_factor).all(dim=2)
-        if include_initial_video_step:
-            video_is_pad = torch.cat([image_is_pad[:, :1], latent_tail_is_pad], dim=1)
-        else:
-            video_is_pad = latent_tail_is_pad
+        full_video_is_pad = torch.cat([image_is_pad[:, :1], latent_tail_is_pad], dim=1)
+        video_is_pad = full_video_is_pad[:, num_excluded_anchor_steps:]
 
         if video_is_pad.shape[1] != video_loss_token.shape[1]:
             raise ValueError(
@@ -485,9 +510,10 @@ class FastWAM(torch.nn.Module):
         latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)  # 加噪后的视频潜变量，作为 DiT 输入，文中 5 式，[B, C_lat, T_lat, H_lat, W_lat]
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)  # 6 式中的 epsl-y，[B, C_lat, T_lat, H_lat, W_lat]，与 input_latents 相同
 
-        # 若开启首帧与潜变量融合：第一帧不加噪，保持干净条件
-        if inputs["first_frame_latents"] is not None:  # 首帧潜变量维度：[B, C_lat, 1, H_lat, W_lat]
-            latents[:, :, 0:1] = inputs["first_frame_latents"]  # 把时间维第 0 段换成干净首帧（没有加噪），输入 Video DiT
+        # 若开启 anchor 帧与潜变量融合：anchor 帧不加噪，保持干净条件
+        if inputs["anchor_latents"] is not None:
+            n_anchor = inputs["anchor_latents"].shape[2]
+            latents[:, :, 0:n_anchor] = inputs["anchor_latents"]
 
         # 动作分支扩散训练：与视频分支类似，在动作空间加噪、采样 t、构造监督目标
         noise_action = torch.randn_like(action)  # 与 action 同形状的高斯噪声，[B, T_a, A]
@@ -499,14 +525,15 @@ class FastWAM(torch.nn.Module):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)  # t 时刻加噪后的动作，作为动作 DiT 输入，[B, T_a, A]
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)  # 与 train_action_scheduler 一致的回归目标，[B, T_a, A]
 
-        video_pre = self.video_expert.pre_dit(  # 视频分支编码
-            x=latents,  # 视频加噪潜变量，[B, C_lat, T_lat, H_lat, W_lat] --> vedio["tokens"]=[B, S_v, D]，S_v = f·h·w，表示时间、高、宽共 3 个维度上
-            timestep=timestep_video,  # 视频分支扩散步，等于样本数，即 [B]
-            context=context,  # 文本条件，[B, L，D_ctx]。L 指条件序列在 token 维上的长度，D_ctx 指的是单个条件 token 的向量维度
-            context_mask=context_mask,  # 条件序列掩码，[B, L]，那么位置应该参与计算，哪些位置应该忽略
-            action=action,  # [B, T_a, A]。pre_dit 始终可接收 action，但 configs/model/fastwam.yaml 里默认为false，只扩展文本 context_mask
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],  # bool，训练 training_loss 里 latents[:,:,0:1] 被换成干净首帧，不监督首帧
-        )  # 包含 vedio tokens 等信息的字典
+        video_pre = self.video_expert.pre_dit(
+            x=latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            num_anchor_frames=self.num_anchor_frames,
+        )
 
         action_pre = self.action_expert.pre_dit(  # 动作分支编码
             action_tokens=noisy_action,  # 加噪后的动作，[B, T_a, A]
@@ -520,12 +547,13 @@ class FastWAM(torch.nn.Module):
         action_tokens = action_pre["tokens"]  # 对 加噪动作 经 action_encoder 得到的 动作 token 序列，供 MoT 动作支路用。[B, S_a, D]，S_a = T_a（动作序列长度，与 action.shape[1] 一致），D 与视频侧 相同（同一 MoT 对齐）。
 
         # 按帧宽构造联合注意力掩码
-        attention_mask = self._build_mot_attention_mask(  # 视频/动作 token 可见性
-            video_seq_len=video_tokens.shape[1],  # 视频序列长度，S_v
-            action_seq_len=action_tokens.shape[1],  # 动作序列长度，S_a
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),  # 不是张量，是 int 标量，表示单帧潜空间 patch token 数
-            device=video_tokens.device,  # 与激活同设备
-        )  # 布尔或屏蔽矩阵，供注意力用。[S_v + S_a, S_v + S_a]，mask[i, j] == True 表示 联合注意力里位置 i 的 Q 可以看位置 j 的 K；False 则 禁止
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_tokens.shape[1],
+            action_seq_len=action_tokens.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_tokens.device,
+            num_anchor_frames=self.num_anchor_frames,
+        )
 
         # mot：Video token 和 Action token 先拼接（联合）在一起做联合自注意力，再各自接条件交叉注意力（cross-atten）
         # tokens_out["video"]： 经过 MoT 全部层 后的 视频侧隐状态序列，[B, S_v, D]，与送入时的 video_tokens 同形
@@ -564,19 +592,19 @@ class FastWAM(torch.nn.Module):
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)  # [B, C_out, T_lat, H_lat, W_lat]，与 input_latents / target_video 同形（C_out 为 DiT 配置的 out_dim，与 VAE 潜通道对齐）
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)  # [B, T_a, A]，与 action / target_action 同形
 
-        # 根据是否有首帧条件计算 Video loss
-        include_initial_video_step = inputs["first_frame_latents"] is None  # 无首帧条件时 首帧与其它帧一样参与 loss
-        if inputs["first_frame_latents"] is not None:  # 有首帧条件时，首帧不监督
-            pred_video = pred_video[:, :, 1:]  # 去掉条件首帧，仅监督后续帧
-            target_video = target_video[:, :, 1:]  # 与 pred 对齐，避免监督首帧
+        # 根据是否有 anchor 条件计算 Video loss
+        n_anchor = 0
+        if inputs["anchor_latents"] is not None:
+            n_anchor = inputs["anchor_latents"].shape[2]
+            pred_video = pred_video[:, :, n_anchor:]
+            target_video = target_video[:, :, n_anchor:]
 
-        # 视频/动作分支各自聚合损失并乘时间步权重，再按 λ 合成总 loss 与日志分项。
-        loss_video_per_sample = self._compute_video_loss_per_sample(  # 每样本视频损失（已处理帧 pad）
-            pred_video=pred_video,  # 潜空间预测，[B, C_out, T_lat, H_lat, W_lat]
-            target_video=target_video,  # epsl-y，[B, C_lat, T_lat, H_lat, W_lat]
-            image_is_pad=image_is_pad,  # 帧无效掩码，[B, T_pix]
-            include_initial_video_step=include_initial_video_step,  # 首帧是否计入时序
-        )  # [B]
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video,
+            target_video=target_video,
+            image_is_pad=image_is_pad,
+            num_excluded_anchor_steps=n_anchor,
+        )
 
         video_weight = self.train_video_scheduler.training_weight(timestep_video).to(  # timestep_video 指视频分支的扩散步，维度是 [B]
             loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
@@ -622,6 +650,7 @@ class FastWAM(torch.nn.Module):
             context_mask=context_mask,
             action=gt_action,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            num_anchor_frames=self.num_anchor_frames,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -635,6 +664,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_pre["tokens"].shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            num_anchor_frames=self.num_anchor_frames,
         )
 
         tokens_out = self.mot(
@@ -670,21 +700,22 @@ class FastWAM(torch.nn.Module):
     @torch.no_grad()
     def _predict_action_noise(
         self,
-        first_frame_latents: torch.Tensor,
+        anchor_latents: torch.Tensor,
         latents_action: torch.Tensor,
         timestep_action: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
     ) -> torch.Tensor:
-        timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
+        timestep_video = torch.zeros_like(timestep_action, dtype=anchor_latents.dtype, device=self.device)
         video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
+            x=anchor_latents,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            num_anchor_frames=self.num_anchor_frames,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -698,6 +729,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_pre["tokens"].shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            num_anchor_frames=self.num_anchor_frames,
         )
         tokens_out = self.mot(
             embeds_all={
@@ -762,7 +794,7 @@ class FastWAM(torch.nn.Module):
     def infer_joint(
         self,
         prompt: Optional[str],
-        input_image: torch.Tensor,
+        input_image: Union[torch.Tensor, list[torch.Tensor]],
         num_video_frames: int,
         action_horizon: int,
         action: Optional[torch.Tensor] = None, # NOTE: this is gt action for conditioning videos, not for action expert
@@ -784,7 +816,7 @@ class FastWAM(torch.nn.Module):
                 raise ValueError("`test_action_with_infer_action=True` requires non-null `seed`.")
             action_only_out = self.infer_action(
                 prompt=prompt,
-                input_image=input_image.clone(),
+                input_image=input_image.clone() if isinstance(input_image, torch.Tensor) else [img.clone() for img in input_image],
                 action_horizon=action_horizon,
                 context=context.clone() if context is not None else None,
                 context_mask=context_mask.clone() if context_mask is not None else None,
@@ -795,14 +827,20 @@ class FastWAM(torch.nn.Module):
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
             )["action"]
-        
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
-            raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
-            )
-        _, _, height, width = input_image.shape
+
+        if isinstance(input_image, list):
+            for i, img in enumerate(input_image):
+                if img.ndim == 3:
+                    input_image[i] = img.unsqueeze(0)
+            _, _, height, width = input_image[0].shape
+        else:
+            if input_image.ndim == 3:
+                input_image = input_image.unsqueeze(0)
+            if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
         if (checked_h, checked_w) != (height, width):
             raise ValueError(
@@ -853,9 +891,14 @@ class FastWAM(torch.nn.Module):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        if isinstance(input_image, list):
+            input_image = [img.to(device=self.device, dtype=self.torch_dtype) for img in input_image]
+            anchor_latents = self._encode_multi_image_latents_tensor(input_image, tiled=tiled)
+        else:
+            input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+            anchor_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        n_anchor = anchor_latents.shape[2]
+        latents_video[:, :, 0:n_anchor] = anchor_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -923,7 +966,7 @@ class FastWAM(torch.nn.Module):
 
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            latents_video[:, :, 0:n_anchor] = anchor_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
         if test_action_with_infer_action:
@@ -942,7 +985,7 @@ class FastWAM(torch.nn.Module):
     def infer_action(
         self,
         prompt: Optional[str],
-        input_image: torch.Tensor,
+        input_image: Union[torch.Tensor, list[torch.Tensor]],
         action_horizon: int,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
@@ -961,13 +1004,19 @@ class FastWAM(torch.nn.Module):
                 "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
             )
 
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
-            raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
-            )
-        _, _, height, width = input_image.shape
+        if isinstance(input_image, list):
+            for i, img in enumerate(input_image):
+                if img.ndim == 3:
+                    input_image[i] = img.unsqueeze(0)
+            _, _, height, width = input_image[0].shape
+        else:
+            if input_image.ndim == 3:
+                input_image = input_image.unsqueeze(0)
+            if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, height, width = input_image.shape
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
                 f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
@@ -993,8 +1042,12 @@ class FastWAM(torch.nn.Module):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        if isinstance(input_image, list):
+            input_image = [img.to(device=self.device, dtype=self.torch_dtype) for img in input_image]
+            anchor_latents = self._encode_multi_image_latents_tensor(input_image, tiled=tiled)
+        else:
+            input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+            anchor_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -1027,17 +1080,18 @@ class FastWAM(torch.nn.Module):
             )
 
         timestep_video = torch.zeros(
-            (first_frame_latents.shape[0],),
-            dtype=first_frame_latents.dtype,
+            (anchor_latents.shape[0],),
+            dtype=anchor_latents.dtype,
             device=self.device,
         )
         video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
+            x=anchor_latents,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
+            num_anchor_frames=self.num_anchor_frames,
         )
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
@@ -1045,6 +1099,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=latents_action.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            num_anchor_frames=self.num_anchor_frames,
         )
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],
