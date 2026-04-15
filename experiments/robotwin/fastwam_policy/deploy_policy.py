@@ -155,6 +155,7 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        action_video_freq_ratio: int,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -178,15 +179,19 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self._action_video_freq_ratio = int(action_video_freq_ratio)
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
-        # Multi-anchor frame history buffer
+        # Multi-anchor raw-frame history buffer. We keep enough consecutive
+        # observations so we can subsample with the training-time video stride.
         self._num_anchor_frames = getattr(self.model, "num_anchor_frames", 1)
-        self._frame_history: deque[torch.Tensor] = deque(maxlen=self._num_anchor_frames)
+        sampled_history_len = max(1, 4 * (self._num_anchor_frames - 1) + 1)
+        self._frame_history_len = 1 + (sampled_history_len - 1) * self._action_video_freq_ratio
+        self._frame_history: deque[torch.Tensor] = deque(maxlen=self._frame_history_len)
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
@@ -237,16 +242,28 @@ class WorldActionRobotWinPolicy:
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
 
+    def _build_multi_anchor_frame_history(self) -> Optional[list[torch.Tensor]]:
+        if self._num_anchor_frames <= 1:
+            return None
+        sampled_len = 4 * (self._num_anchor_frames - 1) + 1
+        sampled_history = list(self._frame_history)[::self._action_video_freq_ratio]
+        if len(sampled_history) != sampled_len:
+            raise ValueError(
+                f"Expected sampled frame history length {sampled_len}, got {len(sampled_history)} "
+                f"(raw_len={len(self._frame_history)}, freq_ratio={self._action_video_freq_ratio})"
+            )
+        return sampled_history
+
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
 
         # Update frame history
         self._frame_history.append(image_tensor)
-        while len(self._frame_history) < self._num_anchor_frames:
+        while len(self._frame_history) < self._frame_history_len:
             self._frame_history.appendleft(self._frame_history[0])
 
-        # Use frame history list for multi-anchor, single tensor otherwise
-        input_image_arg = list(self._frame_history) if self._num_anchor_frames > 1 else image_tensor
+        # Use training-stride subsampled history for multi-anchor, single tensor otherwise.
+        input_image_arg = self._build_multi_anchor_frame_history() if self._num_anchor_frames > 1 else image_tensor
 
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
@@ -406,6 +423,7 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        action_video_freq_ratio=int(cfg.data.train.action_video_freq_ratio),
     )
     return policy
 

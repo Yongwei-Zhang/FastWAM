@@ -281,6 +281,23 @@ def _get_num_video_frames(cfg: DictConfig) -> int:
     return (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
 
 
+def _build_multi_anchor_frame_history(
+    frame_history: deque,
+    action_video_freq_ratio: int,
+    num_anchor_frames: int,
+) -> Optional[list]:
+    if num_anchor_frames <= 1:
+        return None
+    sampled_len = 4 * (num_anchor_frames - 1) + 1
+    sampled_history = list(frame_history)[::action_video_freq_ratio]
+    if len(sampled_history) != sampled_len:
+        raise ValueError(
+            f"Expected sampled frame history length {sampled_len}, got {len(sampled_history)} "
+            f"(raw_len={len(frame_history)}, freq_ratio={action_video_freq_ratio})"
+        )
+    return sampled_history
+
+
 def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
     if not bool(cfg.EVALUATION.get("visualize_future_video", False)):
         return
@@ -500,9 +517,13 @@ def run_single_episode(
         ensembler = ActionEnsembler()
         ensembler.reset()
 
-    # Multi-anchor frame history buffer
+    # Multi-anchor raw-frame history buffer. We keep enough consecutive env-step
+    # observations so we can subsample with the training-time video stride.
     num_anchor_frames = getattr(model, "num_anchor_frames", 1)
-    frame_history: deque = deque(maxlen=num_anchor_frames)
+    action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
+    sampled_history_len = max(1, 4 * (num_anchor_frames - 1) + 1)
+    frame_history_len = 1 + (sampled_history_len - 1) * action_video_freq_ratio
+    frame_history: deque = deque(maxlen=frame_history_len)
 
     replay_images = []
     predicted_future_video_clips: list[dict[str, Any]] = []
@@ -523,15 +544,16 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
-            # Update frame history with current observation
-            if num_anchor_frames > 1:
+            # Initialize frame history only on first replan (empty deque);
+            # subsequent replans already have up-to-date history from post-step updates.
+            if num_anchor_frames > 1 and len(frame_history) == 0:
                 cur_image, _, _ = _obs_to_model_input(
                     obs, cfg=cfg, processor=processor,
                     width=input_w, height=input_h,
                     device=model_device, dtype=model.torch_dtype,
                 )
                 frame_history.append(cur_image)
-                while len(frame_history) < num_anchor_frames:
+                while len(frame_history) < frame_history_len:
                     frame_history.appendleft(frame_history[0])
 
             action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
@@ -545,7 +567,11 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
                 prompt_cache=prompt_cache,
-                frame_history=list(frame_history) if num_anchor_frames > 1 else None,
+                frame_history=_build_multi_anchor_frame_history(
+                    frame_history=frame_history,
+                    action_video_freq_ratio=action_video_freq_ratio,
+                    num_anchor_frames=num_anchor_frames,
+                ),
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1

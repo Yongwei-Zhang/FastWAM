@@ -1,16 +1,20 @@
 train:
+  # _target_ = 要 new 哪个类；后面是 Python import 路径
+  # 配置合并后，训练脚本里 instantiate(cfg.data.train, ...) 时会 import 该类并 RobotVideoDataset(...)，
+  # 用同一段 YAML 里其它键（如 dataset_dirs、processor）当构造参数
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
     - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
     - ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot
     - ./data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
     - ./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+    
   shape_meta:
     images:
       - key: image
       # - key: observation.images.image
-        raw_shape: [3, 512, 512]
-        shape: [3, 224, 224]
+        raw_shape: [3, 512, 512]  # LeRobot 里该路图像 读出后、做训练变换之前 的约定形状：3 通道 × 高 512 × 宽 512（LIBERO 常见分辨率）
+        shape: [3, 224, 224]  # 经下面的 FastWAMProcessor 处理之后，单帧 应达到的形状，用于模型输入（供后续视频拼接与 VAE）
       - key: wrist_image
       # - key: observation.images.wrist_image
         raw_shape: [3, 512, 512]
@@ -25,45 +29,51 @@ train:
       # - key: observation.state
         raw_shape: 8 # before transform
         shape: 8 # after transform
-  # 数据配置中的"原始采样窗口长度"
-  num_frames: 33
-  global_sample_stride: 1
-  action_video_freq_ratio: 4 # 32 action, 9 video frames
-  video_size: [224, 448] # final resize video
-  camera_key: null
-  val_set_proportion: 0.0
-  is_training_set: true
-  pretrained_norm_stats: null  # 显示写入键，在持续训练时能够直接赋值
-  skip_padding_as_possible: false
-  concat_multi_camera: "horizontal"
+
+  # 采样窗口与多相机：num_frames 为原始步数；下采样后得到动作步数与视频帧数供 VAE。
+  num_frames: 33  # 观测序列长度（含首尾）；与 action 条数 num_frames-1 对齐
+  global_sample_stride: 1  # 数据集滑窗/帧索引的全局步长；在 固定长度窗口（obs_size 个观测步、action_size 个动作步）里，相邻两个下标之间在真实时间轴上隔多少帧
+  action_video_freq_ratio: 4  # 每 4 个原始步取 1 帧进视频；得 32 动作步、9 路视频帧
+  video_size: [224, 448]  # 拼接后视频最终缩放的 [H,W]（双机位横拼宽为 2×224）
+  camera_key: null  # 不按单相机键过滤，使用 shape_meta 中全部相机
+  val_set_proportion: 0.0  # 验证集占比；0 表示不划验证
+  is_training_set: true  # 是否训练集（影响 processor 增广与统计）
+  pretrained_norm_stats: null  # 可填路径加载已有归一化统计；null 则训练时现算
+  skip_padding_as_possible: false  # 是否在含 pad 时换样本重采样
+  concat_multi_camera: "horizontal"  # 多相机沿宽度维横向拼接
+
+  # FastWAMProcessor：动作/本体维、归一化与图像 ToTensor+Resize；与 shape_meta, num_frames 对齐。
   processor:
-    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
-    shape_meta: ${data.train.shape_meta}
-    num_obs_steps: ${data.train.num_frames}
-    num_output_cameras: 2
-    action_output_dim: 7 # eef_pose (6) + gripper (1)
-    proprio_output_dim: 8 # eef_pose (6) + gripper (2)
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor  # 样本后处理入口类
+    shape_meta: ${data.train.shape_meta}  # 复用上文各模态 key 与目标形状
+    num_obs_steps: ${data.train.num_frames}  # 观测序列长度，与数据集窗口一致
+    num_output_cameras: 2  # 输出相机路数（可与实际路数对齐或补零）
+    action_output_dim: 7  # eef_pose (6) + gripper (1)，最后 1 维表示目标开度，对应 LeRobot/LIBERO 里常见的 单通道 gripper action
+    proprio_output_dim: 8  # eef_pose (6) + gripper (2)，最后 2 维表示夹爪相关状态 2 维，例如平行夹爪 左右指节关节位置 各 1 维，或等价的两维
     delta_action_dim_mask:
-      default: [true, true, true, true, true, true, false] # eef poses are delta, gripper is not
+      default: [true, true, true, true, true, true, false]  # 仅末端位姿做 delta，夹爪为绝对量
 
     # action & state normalization
-    action_state_transforms: null
+    action_state_transforms: null  # 可选额外任务专用变换；null 表示不用
     # action_state_transforms:
     #   - _target_: fastwam.datasets.lerobot.transforms.libero.LiberoTransform
-    use_stepwise_action_norm: False
-    norm_default_mode: min/max
-    norm_exception_mode: null
+    use_stepwise_action_norm: False  # 是否逐步独立归一（LIBERO 默认关）
+    norm_default_mode: min/max  # 默认 min-max 归一化
+    norm_exception_mode: null  # 例外的归一模式；null 为无
 
     action_state_merger:
-      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    # 把 shape_meta 里多个 key 的 action / state 张量，在最后一维按顺序拼成一条向量，必要时再 右侧 pad 到 action_target_dim / state_target_dim
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign  # 多键 state 左对齐拼接
 
     train_transforms:
-      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor  # 转 float 张量并调整维序
       - _target_: torchvision.transforms.Resize
-        size: [224, 224]
+        size: [224, 224]  # 与 shape_meta.shape 中 224 一致
     val_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [224, 224]
-  text_embedding_cache_dir: ./data/text_embeds_cache/libero
-  context_len: 128
+        size: [224, 224]  # 验证与训练同一空间分辨率
+
+  # 预计算 T5 文本嵌入缓存目录（load_text_encoder=false 时训练必读）；与 precompute 脚本、tokenizer_max_len 一致。
+  text_embedding_cache_dir: ./data/text_embeds_cache/libero  # 按 prompt 哈希存 .pt，供 Dataset 加载 context/mask
+  context_len: 128  # 文本序列 pad/截断长度；须与 model.tokenizer_max_len、缓存文件名中 t5_len 一致

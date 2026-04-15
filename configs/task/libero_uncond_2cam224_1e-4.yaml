@@ -1,31 +1,36 @@
 # @package _global_
 
+# 这里定义了覆盖的 data 和 model
 defaults:
-  - override /data: libero_2cam
-  - override /model: fastwam
-  - _self_
+  - override /data: libero_2cam  # - configs/data/libero_2cam.yaml 中定义
+  - override /model: fastwam  # - configs/model/fastwam.yaml 中定义
+  - _self_  # 本文件在 defaults 解析后再应用，保证此处覆盖生效
 
 # dataloading
-# 如果设置过大容易导致 Libero 训练时 GPU OOM
+# 每步每个进程的样本数，如果设置过大容易导致 Libero 训练时 GPU OOM
 batch_size: 16
 
-# 如果设置过大容易导致 Libero 训练时 CPU OOM
+# DataLoader 子进程数，如果设置过大容易导致 Libero 训练时 CPU OOM
 num_workers: 2
 
+# 关闭 MoT 里混合注意力的 gradient checkpoint（与 fastwam.yaml 默认 true 相反）。训练更快，但显存更高
 model:
   mot_checkpoint_mixed_attn: false
 
 # scheduler
-lr_scheduler_type: "cosine"
+lr_scheduler_type: "cosine"  # 学习率调度：余弦衰减
 learning_rate: 1e-4
-num_epochs: 10
+# 1 个 epoch = 把训练集按 DataLoader 完整扫一遍（每个样本在该轮里通常出现一次，顺序由 sampler 决定）
+num_epochs: 10  # 把 max_steps 设为 null 时，num_epochs 才会用来估算总步数：每 epoch 的 optimizer 步数 × num_epochs
 # max_steps: null
 max_steps: 20000
 log_every: 10
-save_every: 2000
+save_every: 2000  # 多少次存一次 checkpoint
 eval_every: 200
 
 # training
-gradient_accumulation_steps: 1
-weight_decay: 1e-2
-resume: null
+# 在 N 个 micro-batch 上各做一次 backward，梯度相加；仅在 累积满 N 次（且 sync_gradients 为真）时 optimizer.step() 一次，等价于 把有效 batch 放大
+# 有效全局 batch = batch_size × GPU 数 × gradient_accumulation_steps
+gradient_accumulation_steps: 1  # 梯度累积步数，1 表示不累积，即一次 optimizer.step() 对应的 micro-batch 个数。N 表示 N 个 micro-batch 各 backward，梯度累加，第 N 次同步后再 step()
+weight_decay: 1e-2  # AdamW 的 weight decay
+resume: null  # 不从 checkpoint 恢复；填路径则恢复训练

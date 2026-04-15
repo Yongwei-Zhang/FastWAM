@@ -1,62 +1,86 @@
-_target_: fastwam.runtime.create_fastwam
-model_id: Wan-AI/Wan2.2-TI2V-5B
-tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
-tokenizer_max_len: 128
-load_text_encoder: false
-proprio_dim: ${data.train.processor.proprio_output_dim}
-redirect_common_files: true
-mot_checkpoint_mixed_attn: true
-action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
-skip_dit_load_from_pretrain: false
+# FastWAM 构建入口与底模/tokenizer/ActionDiT/MoT 显存策略及多锚帧数：供 Hydra 组态与训练对齐。
+# 工厂函数：按配置加载/跳过 Wan 的 VideoDiT、VAE、（可选）T5+tokenizer、ActionDiT 初始化、组装 FastWAM。没有额外业务逻辑，就是 配置 → 可训练模型实例 的入口
+_target_: fastwam.runtime.create_fastwam  # 模型工厂函数，fastwam 是可安装的包，工厂函数地址：src/fastwam/runtime.py 
+model_id: Wan-AI/Wan2.2-TI2V-5B  # Wan2.2 TI2V 底模 id（权重来源）
+
+# tokenizer_model_id 指定从哪个 HuggingFace 仓库拉 与 Wan 配套的 UMT5 词表/分词器
+# src/fastwam/models/wan22/helpers/loader.py 里 tokenizer_config 的 origin_file_pattern 为 google/umt5-xxl/
+# 文本先被 tokenize，再（若加载 T5）送进 UMT5-XXL 编码器 得到 context
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B  # 文本 tokenizer 模型 id
+tokenizer_max_len: 128  # tokenizer 最大序列长度；训练若走 预计算嵌入，还需与数据侧 context_len 等一致
+
+# T5：Wan 管线里的 UMT5-XXL 文本编码器
+# False：不下载、不加载 T5 编码器与 tokenizer；训练/推理须用 预计算的 context / context_mask（数据集或缓存）
+load_text_encoder: false  # 使用预计算 T5 嵌入时不在模型内加载 T5
+
+# 由 OmegaConf 解析 ${data.train.processor.proprio_output_dim}，当前 LIBERO 任务在 configs/data/libero_2cam.yaml 中
+# 启动时若使用 task=libero_uncond_2cam224_1e-4（或任何在 defaults 里写了 override /data: libero_2cam 的 task），
+# 会加载 configs/data/libero_2cam.yaml，并挂到配置树的 data: 下。即相关参数在 libero_2cam.yaml 里设置，在这里加载
+# 如何确认？看当前 task 的 configs/task/*.yaml 里 defaults 的 /data: 选的是哪个
+proprio_dim: ${data.train.processor.proprio_output_dim}  # 本体向量维度，与数据 processor 一致
+
+redirect_common_files: true  # 将常用缓存/权重路径重定向到本地目录
+mot_checkpoint_mixed_attn: true  # MoT 混合注意力分支启用 gradient checkpoint 以省显存
+
+# ActionDiT 仍由 action_dit_pretrained_path 等单独处理
+action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt  # ActionDiT 初始化权重路径
+
+# 为 False，会从 Wan2.2 视频 DiT 预训练权重加载 Video 分支（WanVideoDiT），来源于上面的 model_id
+# 对应的文件位置是：src/fastwam/models/wan22/helpers/loader.py 的 load_wan22_ti2v_5b_components 分支（约 170–186 行）
+skip_dit_load_from_pretrain: false  # 为 true 时跳过从 Wan 预训练加载 VideoDiT
+
 # 如果当前数据设置 num_frames=9（3 latent frames），则num_anchor_frames 至多为2（保留1帧用于去噪）
-num_anchor_frames: 1
+num_anchor_frames: 1  # 作为干净条件注入的 latent anchor 帧数
 
+# WanVideoDiT 结构：patch/维度/注意力层数与 Wan2.2 对齐；首帧 fuse 时训练换干净 anchor、视频 loss 不监督首帧。
 video_dit_config:
-  has_image_input: false
-  patch_size: [1, 2, 2]
-  in_dim: 48
-  hidden_dim: 3072
-  ffn_dim: 14336
-  freq_dim: 256
-  text_dim: 4096
-  out_dim: 48
-  num_heads: 24
-  attn_head_dim: 128
-  num_layers: 30
-  eps: 1.0e-06
-  seperated_timestep: true
-  require_clip_embedding: false
-  require_vae_embedding: false
-  # 默认为 True，build_inputs（fastwam.py中函数） 里 first_frame_latents = input_latents[:,:,0:1]；训练 training_loss 里 latents[:,:,0:1] 被换成干净首帧
-  # pre_dit 走 seperated_timestep + fuse 分支（首帧 token 的【扩散步】嵌入为 0）；视频 loss 对 pred_video/target_video 做 [:,:,1:]，不监督首帧。
-  fuse_vae_embedding_in_latents: true
-  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
-  video_attention_mask_mode: "first_frame_causal" # default
-  action_conditioned: false
-  action_dim: ${data.train.processor.action_output_dim}
-  action_group_causal_mask_mode: "group_diagonal"
+  has_image_input: false  # 无单独图像条件支路
+  patch_size: [1, 2, 2]  # 时空 patch（T,H,W）；用于 WanVideoDiT里的 3D 卷积：时间维T，高度H，宽度W
+  in_dim: 48  # 输入 latent 通道维（与 VAE 一致）
+  hidden_dim: 3072  # Transformer 隐藏维
+  ffn_dim: 14336  # 前馈层中间维
+  freq_dim: 256  # 时间步等频域嵌入维
+  text_dim: 4096  # 文本条件维（经 text_embedding 与 cross-attn 对齐）
+  out_dim: 48  # 输出 latent 通道维
+  num_heads: 24  # 多头注意力头数
+  attn_head_dim: 128  # 每头维度，128*24=3072，即Transformer的隐藏维度
+  num_layers: 30  # Transformer 块数，Encoder 里中间的 N 的个数
+  eps: 1.0e-06  # LayerNorm 等 epsilon
+  seperated_timestep: true  # 时间步嵌入走独立分支（与 Wan 一致）
+  require_clip_embedding: false  # 不使用 CLIP 嵌入
+  require_vae_embedding: false  # 不强制额外 VAE 嵌入输入
+  fuse_vae_embedding_in_latents: true  # 首帧与扩散步融合；首帧扩散步嵌入为 0，loss 仅对非首帧 latent
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}  # 与 mot_checkpoint_mixed_attn 联动省显存
+  video_attention_mask_mode: "first_frame_causal"  # 视频 token 注意力掩码策略（默认首帧因果）
+  action_conditioned: false  # 本支路不向 VideoDiT 注入动作（动作在 MoT/ActionDiT）
+  action_dim: ${data.train.processor.action_output_dim}  # 预留动作维，与数据 processor 一致
+  action_group_causal_mask_mode: "group_diagonal"  # 动作分组因果掩码模式（与 joint 等扩展一致）
 
+# ActionDiT（动作专家）：由 Wan VideoDiT 权重线性插值初始化，与 MoT 中动作 token 对齐。
 action_dit_config:
-  action_dim: ${data.train.processor.action_output_dim}
-  hidden_dim: 1024
-  ffn_dim: 4096
-  num_heads: 24
-  attn_head_dim: 128
-  num_layers: 30
-  text_dim: 4096
-  freq_dim: 256
-  eps: 1.0e-06
-  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  action_dim: ${data.train.processor.action_output_dim}  # 每步动作维度，与数据 processor 一致
+  hidden_dim: 1024  # 动作分支隐藏维（低于视频 3072）
+  ffn_dim: 4096  # 前馈层中间维；每个 DiTBlock 的 MLP 中间层宽度由 ffn_dim 传入
+  num_heads: 24  # 多头注意力头数
+  attn_head_dim: 128  # 每头维度
+  num_layers: 30  # Transformer 块数
+  text_dim: 4096  # 与文本条件维一致，便于与 T5 输出对接
+  freq_dim: 256  # 时间步正弦嵌入维；表示 扩散时间标量 t（标量 timestep） 先做 正弦位置式编码 的 维度，再送进 time_embedding
+  eps: 1.0e-06  # LayerNorm epsilon
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}  # 与 MoT 开关一致省显存
 
+# 视频分支 flow-matching：训练/推理噪声日程与离散化步数。
 video_scheduler:
-  train_shift: 5.0
-  infer_shift: 5.0
-  num_train_timesteps: 1000
+  train_shift: 5.0  # 训练时噪声分布平移（flow 常用超参）
+  infer_shift: 5.0  # 推理时与训练对齐的 shift
+  num_train_timesteps: 1000  # 训练离散时间步数（与采样调度一致）
 
+# 动作分支 flow-matching：可与视频分支独立设定。
 action_scheduler:
-  train_shift: 5.0
-  infer_shift: 5.0
-  num_train_timesteps: 1000
+  train_shift: 5.0  # 动作噪声 schedule 平移
+  infer_shift: 5.0  # 推理 shift
+  num_train_timesteps: 1000  # 动作扩散步数
 
+# 训练总损失：lambda_video 默认 1.0 在代码中；此处显式动作项权重。
 loss:
-  lambda_action: 1.0
+  lambda_action: 1.0  # 动作 loss 相对视频项的权重

@@ -117,11 +117,33 @@ class FastWAM(torch.nn.Module):
         loss_lambda_action: float = 1.0,
         num_anchor_frames: int = 1,
     ):
+        """从 Wan2.2 TI2V 预训练加载组件，组装 VideoDiT + ActionDiT + MoT，返回 ``FastWAM`` 实例。
+        TI2V 在 Wan 这条产品线里指 Text-and-Image-to-Video：同时用文本提示 + 参考图像（常见为首帧/条件图）生成视频 的那类模型
+        T2V 偏纯文生视频，I2V 偏纯图生视频；TI2V 表示一条管线（pipeline，即数据从输入到输出固定串联起来的一整条处理链条）里两种条件都支持、可一起用
+
+        - ``device`` / ``torch_dtype``: 权重与计算设备、主网络 dtype。
+        - ``model_id``: HuggingFace 上 Wan2.2 底模仓库 id（VideoDiT/VAE 等来源）。
+        - ``tokenizer_model_id``: UMT5 分词器仓库 id。
+        - ``tokenizer_max_len``: 文本 token 最大长度。
+        - ``load_text_encoder``: 是否加载 UMT5 文本编码器；``False`` 时依赖外部预计算 context。
+        - ``proprio_dim``: 本体向量维数；``None`` 表示不注入 proprio。
+        - ``redirect_common_files``: 是否将常用缓存/权重重定向到本地路径。
+        - ``video_dit_config``: 视频 DiT 配置 dict，**必填**且须含 ``text_dim``；传入 ``load_wan22_ti2v_5b_components``。
+        - ``action_dit_config`` / ``action_dit_pretrained_path``: 动作 DiT 结构与可选预训练权重。
+        - ``skip_dit_load_from_pretrain``: 为 ``True`` 时跳过从 Wan 预训练加载 VideoDiT 权重。
+        - ``mot_checkpoint_mixed_attn``: MoT 混合注意力分支是否启用 gradient checkpoint。
+        - ``video_*`` / ``action_*``（train/infer shift、num_train_timesteps）: 视频与动作分支连续扩散调度参数。
+        - ``loss_lambda_video`` / ``loss_lambda_action``: 联合训练时视频与动作 loss 权重。
+        - ``num_anchor_frames``: 潜空间锚点帧数（干净条件历史帧数）。
+
+        流程：拉取 Wan 组件 → 构建 ``ActionDiT`` 并校验与 VideoDiT 层数/头维一致 → 封装 ``MoT`` → ``cls(...)`` 构造 ``FastWAM`` 并记录 ``model_paths``。
+        """
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
         if "text_dim" not in video_dit_config:
             raise ValueError("`video_dit_config['text_dim']` is required for FastWAM.")
 
+        # 返回的结果包括：``dit``、``vae``、``text_encoder``/``tokenizer``（可 ``None``）及各自路径
         components = load_wan22_ti2v_5b_components(
             device=device,
             torch_dtype=torch_dtype,
@@ -135,6 +157,8 @@ class FastWAM(torch.nn.Module):
         )
 
         video_expert = components.dit
+
+        # ActionDiT 不是 Wan 仓库里的现成子模块，而是 FastWAM 里单独定义的 动作分支，不应塞进「只拉 Wan 官方组件」的函数里
         action_expert = ActionDiT.from_pretrained(
             action_dit_config=action_dit_config,
             action_dit_pretrained_path=action_dit_pretrained_path,
@@ -142,6 +166,7 @@ class FastWAM(torch.nn.Module):
             device=device,
             torch_dtype=torch_dtype,
         )
+
         if int(action_expert.num_heads) != int(video_expert.num_heads):
             raise ValueError("ActionDiT `num_heads` must match video expert for MoT mixed attention.")
         if int(action_expert.attn_head_dim) != int(video_expert.attn_head_dim):
@@ -149,12 +174,16 @@ class FastWAM(torch.nn.Module):
         if int(len(action_expert.blocks)) != int(len(video_expert.blocks)):
             raise ValueError("ActionDiT `num_layers` must match video expert.")
 
-        # mot 中专家的 name 分别是 video 和 action
+        # MoT：VideoDiT 与 ActionDiT 层数/头数/头维一致时逐层对齐；
+        # 各专家对自己的 token 算 Q/K/V，在序列维拼成 [video||action] 做一次混合自注意力（flash-attn），再按长度切回两路，各自接 cross-attn（文本等）与 FFN；
+        # 两路在同一深度通过该次注意力相互可见。
+        # `mot_checkpoint_mixed_attn` 为 True 时仅对这一步混合注意力（不用单独对Token计算QKV）做 gradient checkpoint 以省显存。
         mot = MoT(
             mixtures={"video": video_expert, "action": action_expert},
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
         )
 
+        # 在 FastWAM 里定义时 cls 即 FastWAM 类本身，因此 cls=FastWAM，从而得到训练/推理里用的整条 FastWAM 模型
         model = cls(
             video_expert=video_expert,
             action_expert=action_expert,
@@ -279,12 +308,42 @@ class FastWAM(torch.nn.Module):
         tile_size=(30, 52),
         tile_stride=(15, 26),
     ) -> torch.Tensor:
-        """Encode N observation frames independently, return [1, C, N, H_lat, W_lat]."""
-        latents = []
+        """Encode consecutive observation frames via causal VAE.
+
+        Args:
+            input_images: Exactly ``4*(num_anchor_frames-1)+1`` consecutive
+                observation frames (each [1,3,H,W] or [3,H,W]).  The caller
+                is responsible for collecting real sequential frames so the
+                causal VAE sees genuine temporal variation, matching the
+                training-time encoding of multi-frame video segments.
+
+        Returns:
+            Latent tensor [1, C, num_anchor_frames, H_lat, W_lat].
+        """
+        if len(input_images) == 1:
+            return self._encode_input_image_latents_tensor(
+                input_images[0], tiled=tiled, tile_size=tile_size, tile_stride=tile_stride,
+            )
+        expected_t = 4 * (self.num_anchor_frames - 1) + 1
+        if len(input_images) != expected_t:
+            raise ValueError(
+                f"_encode_multi_image_latents_tensor expects "
+                f"4*(num_anchor_frames-1)+1 = {expected_t} frames, "
+                f"got {len(input_images)}"
+            )
+        # Concatenate real consecutive frames into video: [3, T, H, W]
+        frame_slices = []
         for img in input_images:
-            z = self._encode_input_image_latents_tensor(img, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-            latents.append(z)
-        return torch.cat(latents, dim=2)
+            frame = img.to(device=self.device)
+            if frame.ndim == 4:
+                frame = frame[0]  # [1,3,H,W] → [3,H,W]
+            frame_slices.append(frame.unsqueeze(1))  # [3, 1, H, W]
+        video = torch.cat(frame_slices, dim=1)  # [3, T, H, W]
+        z = self.vae.encode(
+            [video], device=self.device,
+            tiled=tiled, tile_size=tile_size, tile_stride=tile_stride,
+        )
+        return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
@@ -392,7 +451,20 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
                 )
-            proprio = proprio[:, self.num_anchor_frames - 1, :] # [B, D]
+            # Map latent anchor index to raw action step index for correct temporal alignment.
+            # Latent 0 covers video frame 0; latent i (i>0) covers video frames 1+4*(i-1) .. 4*i.
+            # Last video frame in anchor window = 4*(num_anchor_frames-1) for N>1, else 0.
+            # Raw step index = video_frame_idx * action_video_freq_ratio.
+            num_video_frames = video.shape[2]
+            action_horizon = int(action.shape[1])
+            freq_ratio = action_horizon // (num_video_frames - 1)
+            vae_t_factor = self.vae.temporal_downsample_factor
+            if self.num_anchor_frames == 1:
+                proprio_idx = 0
+            else:
+                last_anchor_video_frame = vae_t_factor * (self.num_anchor_frames - 1)
+                proprio_idx = last_anchor_video_frame * freq_ratio
+            proprio = proprio[:, proprio_idx, :] # [B, D]
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,

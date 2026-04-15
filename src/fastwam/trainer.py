@@ -26,6 +26,20 @@ logger = get_logger(__name__)
 
 
 class Wan22Trainer:
+    """FastWAM / Wan22 训练编排：基于 Accelerate 的单进程或多卡训练循环。
+
+    职责：用 ``train_dataset`` 构建 ``DataLoader``（``ResumableEpochSampler``），仅训练 ``model.dit``（及可选 ``proprio_encoder``），
+    AdamW + LR 调度，梯度累积与裁剪；按步记录日志与 WandB；按间隔调用 ``evaluate()``（验证集上随机抽一条样本）并 ``save_checkpoint()``。
+
+    核心持有：``accelerator``、``model``、``optimizer``、``scheduler``、``train_loader`` / ``train_sampler``、
+    ``train_dataset`` / ``val_dataset``、输出与 checkpoint 路径。
+
+    对外入口：``train()``（由 ``runtime.run_training`` 调用）。训练步内主要调底层模型：
+    ``training_loss(batch)``（反传）；``evaluate()`` 内调 ``training_loss``、``infer``、以及 VAE 编解码与视频/动作指标。
+
+    断点：``resume`` 触发 ``load_training_state`` / ``load_checkpoint``；存盘由 ``save_checkpoint``、``load_training_state`` 配合 Accelerate。
+    """
+
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
         self.train_dataset = train_dataset
@@ -203,6 +217,9 @@ class Wan22Trainer:
         )
 
     def _estimate_total_train_steps(self) -> int:
+        """
+        估计总的训练步数，如果指定则用指定的，不指定则用默认公式计算
+        """
         if self.max_steps is not None:
             return max(int(self.max_steps), 1)
 

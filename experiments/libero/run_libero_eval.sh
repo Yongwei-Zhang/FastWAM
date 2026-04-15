@@ -34,9 +34,11 @@ NUM_GPUS="1"  # 参数设置，等号2边不能有空格
 # 每张 GPU 上的最大任务数（官方脚本给的是2）
 MAX_TASKS_PER_GPU=2
 
-# 可选：覆盖 MULTIRUN.task_suite_names（1～4 个，逗号分隔，无空格）。
-# 例：libero_spatial,libero_object  或  libero_10
-# 留空则沿用 Hydra 默认（configs/sim_libero.yaml 中的列表）。
+# 可选：仅在本脚本内使用；用于下面组装 MULTIRUN.task_suite_names= 传给 Python。
+# 勿在「bash 本脚本」的命令行里写 TASK_SUITE_NAMES=…（那不是 Hydra 键，会报错）。
+# 命令行改 suite 请用：MULTIRUN.task_suite_names=[libero_spatial,...]
+# 例（脚本内填）：libero_spatial,libero_object  或  libero_10
+# 留空则沿用 sim_libero.yaml 默认列表。
 TASK_SUITE_NAMES=""
 # TASK_SUITE_NAMES="libero_spatial"
 

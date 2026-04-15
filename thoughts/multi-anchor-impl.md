@@ -13,7 +13,7 @@
 - `num_anchor_frames` 指 **latent frames** 数量
 - `num_anchor_frames=1`: 1 latent anchor（= raw frame 0），2 latent 去噪 → 原始行为
 - `num_anchor_frames=2`: 2 latent anchors（= raw frames 0-4），1 latent 去噪
-- 推理时: 每帧独立 VAE 编码（T=1 → 1 latent），N 帧 concat → 无 T%4==1 限制
+- 推理时: 评测脚本维护 `deque(maxlen=4*(N-1)+1)` 连续观测帧缓冲，直接拼接成 real video 送 causal VAE 编码，确保与训练侧编码路径语义对齐
 
 ---
 
