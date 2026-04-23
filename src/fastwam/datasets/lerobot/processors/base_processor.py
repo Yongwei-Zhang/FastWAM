@@ -35,10 +35,12 @@ class BaseProcessor(ABC):
         drop_high_level_prob: float,
         use_zh_instruction: bool,
 
-        tokenizer: Any
+        tokenizer: Any,
+        num_action_steps: Optional[int] = None,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
+        self.num_action_steps = int(num_action_steps) if num_action_steps is not None else (num_obs_steps - 1)
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
@@ -227,6 +229,9 @@ class BaseProcessor(ABC):
             sample["action_is_pad"] = data["action_is_pad"] # [action_horizon,]
             sample["action_dim_is_pad"] = data["action_dim_is_pad"] # [action_dim,]
             assert sample["action"].shape[-1] == self.action_output_dim
+            assert sample["action"].shape[0] == self.num_action_steps, (
+                f"`action` shape[0]={sample['action'].shape[0]} mismatch with `num_action_steps`={self.num_action_steps}"
+            )
         
         # TODO: rename all "state" into "proprio"
         sample["proprio"] = data["state"] # [num_obs_steps, proprio_dim]
@@ -258,6 +263,7 @@ class BaseProcessor(ABC):
             for trans in reversed(self.action_state_transforms):
                 data = trans.backward(data)
 
+        # NOTE: multi-anchor 语义下 dataset 已右移 action；该切片仅兼容旧 baseline 路径，调用前请重审起点。
         start_obs_step = self.num_obs_steps - 1
         data["action"] = dict_apply(data["action"], lambda x: x[:, start_obs_step:, :])
         return data

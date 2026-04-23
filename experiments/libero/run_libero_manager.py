@@ -105,6 +105,7 @@ def run_evaluation(
         print(f"Forwarded overrides: {extra_args}")
 
     try:
+        # 用 subprocess.run(["bash", "experiments/libero/run_libero_parallel_test.sh", str(task_file)], env=...) 起并行脚本
         subprocess.run(
             ["bash", str(script_path), str(task_file)],
             env=env,
@@ -121,34 +122,35 @@ def run_evaluation(
         raise
 
 
-# 固定用 config_name="sim_libero.yaml"，MULTIRUN.task_suite_names 以 configs/sim_libero.yaml 为准。
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
+# 固定用 config_name="sim_libero.yaml"，MULTIRUN.task_suite_names（libero_spatial等） 以 configs/sim_libero.yaml 为准。
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")  # 工作目录与超参自 configs/sim_libero.yaml
 def main(cfg: DictConfig):
-    if cfg.ckpt is None:
+    # 管理端入口：校验必选项 → 生成任务表与配置快照
+    if cfg.ckpt is None:  # 无权重则无法跑仿真
         raise ValueError("ckpt must not be None.")
-    if cfg.EVALUATION.output_dir is None:
+    if cfg.EVALUATION.output_dir is None:  # 子进程与写盘都依赖此根目录
         raise ValueError("EVALUATION.output_dir must not be None.")
 
-    task_choice = _resolve_worker_task_choice()
-    manager = cfg.MULTIRUN
+    task_choice = _resolve_worker_task_choice()  # 当前选中的 task= 配置名，经环境交给并行脚本
+    manager = cfg.MULTIRUN  # 含 task_suite、GPU 数、任务表路径、create_only 等
 
-    output_dir = Path(os.path.expanduser(os.path.expandvars(str(cfg.EVALUATION.output_dir))))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(os.path.expanduser(os.path.expandvars(str(cfg.EVALUATION.output_dir))))  # 展开 ~ 与 $VAR
+    output_dir.mkdir(parents=True, exist_ok=True)  # 先建目录，便于写 tasks 与 config 备份
 
-    task_file_cfg = manager.get("task_file")
-    if task_file_cfg:
+    task_file_cfg = manager.get("task_file")  # 可选：自定义任务表文件路径
+    if task_file_cfg:  # 显式则用之
         task_file = Path(os.path.expanduser(os.path.expandvars(str(task_file_cfg))))
-    else:
+    else:  # 否则默认与本次 run 的 output 放一起
         task_file = output_dir / "tasks.txt"
-    task_file = create_task_file(task_file, list(manager.task_suite_names))
+    task_file = create_task_file(task_file, list(manager.task_suite_names))  # 将各 suite 展平为 suite,task_id 行
 
-    OmegaConf.save(config=cfg, f=str(output_dir / "manager_config.yaml"))
+    OmegaConf.save(config=cfg, f=str(output_dir / "manager_config.yaml"))  # 存本次运行完整 cfg 便于复现
 
-    if bool(manager.get("create_only", False)):
+    if bool(manager.get("create_only", False)):  # 只生成任务表与 config，不 spawn 子进程
         print("create_only=True, only create the task list and exit.")
         return
 
-    run_evaluation(
+    run_evaluation(  # 调 bash 为各 GPU/worker 注入环境变量并执行并行评测
         task_file=task_file,
         task_choice=task_choice,
         ckpt=str(cfg.ckpt),
@@ -156,9 +158,25 @@ def main(cfg: DictConfig):
         num_trials=int(cfg.EVALUATION.num_trials),
         max_tasks_per_gpu=int(manager.max_tasks_per_gpu),
         output_dir=output_dir,
-        extra_overrides=collect_worker_overrides(),
+        extra_overrides=collect_worker_overrides(),  # 透传非 MULTIRUN/hydra 等屏蔽项外的 CLI 覆盖
     )
 
 
 if __name__ == "__main__":
+    """文件调用概述：
+    1、run_libero_manager.main（sim_libero.yaml）
+
+    2、create_task_file → 生成 tasks.txt（suite,task_id 每行）
+
+    3、run_evaluation
+    
+    4、run_libero_parallel_test.sh（run_libero_eval）：读任务表、tmux/多 GPU 调度、对每个子任务：
+    python eval_libero_single.py，Hydra：task=CONFIG、ckpt、EVALUATION.task_suite_name / task_id / gpu_id 等
+    eval_single_process（eval_libero_single 的 @hydra.main 入口，约 783+ 行）
+    加载 checkpoint、FastWAMProcessor、任务 suite/task（LIBERO benchmark）
+    run_single_task
+    每个 trial：run_single_episode（LIBERO env、观测 → 模型 → env.step）
+    
+    5、全部子任务结束后，shell 可跑 experiments/libero/summarize_results.py --output_dir=...（约 636–638 行）
+    """
     main()

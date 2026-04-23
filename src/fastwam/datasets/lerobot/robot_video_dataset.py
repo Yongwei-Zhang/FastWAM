@@ -42,25 +42,103 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        action_horizon: Optional[int] = None,
+        num_anchor_frames: int = 1,
+        num_denoise_latent_frames: Optional[int] = None,
     ):
+        # Multi-anchor consistency: derive action window from latent semantics.
+        num_anchor_frames = int(num_anchor_frames)
+        assert num_anchor_frames >= 1, f"`num_anchor_frames` must be >= 1, got {num_anchor_frames}"
+        assert (num_frames - 1) % action_video_freq_ratio == 0, \
+            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {action_video_freq_ratio}"
+        sampled_T = (num_frames - 1) // action_video_freq_ratio + 1
+        assert (sampled_T - 1) % 4 == 0, \
+            f"sampled video frames-1 must be divisible by 4, got {sampled_T - 1}"
+        num_latent_frames = 1 + (sampled_T - 1) // 4
+        assert num_latent_frames > num_anchor_frames, \
+            f"`num_latent_frames` ({num_latent_frames}) must be > `num_anchor_frames` ({num_anchor_frames})"
+        expected_action_horizon = action_video_freq_ratio * 4 * (num_latent_frames - num_anchor_frames)
+        if action_horizon is None:
+            action_horizon = expected_action_horizon
+        action_horizon = int(action_horizon)
+        assert action_horizon == expected_action_horizon, (
+            f"`action_horizon` ({action_horizon}) must equal "
+            f"action_video_freq_ratio*4*(num_latent_frames-num_anchor_frames) ({expected_action_horizon})"
+        )
+        if num_denoise_latent_frames is not None:
+            assert int(num_denoise_latent_frames) == num_latent_frames - num_anchor_frames, (
+                f"`num_denoise_latent_frames` ({num_denoise_latent_frames}) must equal "
+                f"num_latent_frames - num_anchor_frames ({num_latent_frames - num_anchor_frames})"
+            )
+        action_start_offset = 4 * action_video_freq_ratio * (num_anchor_frames - 1)
+
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
             obs_size=num_frames,
-            action_size=num_frames - 1,
+            action_size=action_horizon,
+            action_start_offset=action_start_offset,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
         )
-    
+
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
-        
-        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
-            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
-        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
-            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
+        self.action_horizon = action_horizon
+        self.num_anchor_frames = num_anchor_frames
+        self.num_denoise_latent_frames = (
+            int(num_denoise_latent_frames)
+            if num_denoise_latent_frames is not None
+            else (num_latent_frames - num_anchor_frames)
+        )
+        self.action_start_offset = action_start_offset
         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+
+        # Multi-anchor diagnostic: under N>1 the observation window is longer (49 raw steps for
+        # N=M=2 vs. 33 for N=1) and the action window is right-shifted by `action_start_offset`,
+        # so episodes that are shorter than `num_frames + action_start_offset` will produce
+        # all-pad samples at every sliding-window start. Emit a one-shot summary on the main
+        # process so users can detect data issues (e.g. short demos, dataset corruption) early.
+        if PartialState().is_main_process:
+            try:
+                ep_from = self.lerobot_dataset.episode_data_index["from"].to(torch.long)
+                ep_to = self.lerobot_dataset.episode_data_index["to"].to(torch.long)
+                ep_lengths = (ep_to - ep_from).tolist()
+                if len(ep_lengths) > 0:
+                    ep_min = int(min(ep_lengths))
+                    ep_max = int(max(ep_lengths))
+                    ep_mean = float(sum(ep_lengths)) / float(len(ep_lengths))
+                    required_min = int(num_frames)  # enough to cover obs window
+                    required_no_pad = int(num_frames + action_start_offset)  # to avoid action pad on first sample
+                    num_too_short = sum(1 for L in ep_lengths if L < required_min)
+                    num_action_may_pad = sum(1 for L in ep_lengths if L < required_no_pad)
+                    tag = "train" if is_training_set else "val"
+                    logger.info(
+                        "[RobotVideoDataset/%s] episodes=%d | length min=%d mean=%.1f max=%d | "
+                        "num_frames=%d, action_start_offset=%d, action_horizon=%d, num_anchor_frames=%d",
+                        tag, len(ep_lengths), ep_min, ep_mean, ep_max,
+                        num_frames, action_start_offset, action_horizon, num_anchor_frames,
+                    )
+                    if num_too_short > 0:
+                        logger.warning(
+                            "[RobotVideoDataset/%s] %d/%d episodes are shorter than num_frames=%d; "
+                            "these will produce fully-padded obs windows. Consider filtering them "
+                            "out upstream or reducing `num_anchor_frames`/`num_denoise_latent_frames`.",
+                            tag, num_too_short, len(ep_lengths), required_min,
+                        )
+                    elif num_action_may_pad > 0 and num_anchor_frames > 1:
+                        logger.info(
+                            "[RobotVideoDataset/%s] %d/%d episodes are shorter than "
+                            "num_frames+action_start_offset=%d; rolling samples at their tail will "
+                            "produce action pad. Enable `skip_padding_as_possible=true` if you want "
+                            "to resample those windows.",
+                            tag, num_action_may_pad, len(ep_lengths), required_no_pad,
+                        )
+            except Exception as diag_err:  # defensive; diagnostic should never fail hard
+                logger.warning(
+                    "[RobotVideoDataset] episode length diagnostic failed: %s", diag_err,
+                )
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -121,22 +199,30 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if not self.skip_padding_as_possible:
                 break
 
+            # Evaluate pad masks against the windows actually fed to the model:
+            # - action: BaseLerobotDataset already returned the right-shifted `action_horizon` window.
+            # - proprio: slice the 32-step window starting at `action_start_offset`.
+            # - image : slice to the sampled video frames (decimated by `action_video_freq_ratio`).
             action_is_pad = sample["action_is_pad"]
             image_is_pad = sample["image_is_pad"]
             proprio_is_pad = sample["proprio_is_pad"]
+            proprio_is_pad_window = proprio_is_pad[
+                self.action_start_offset: self.action_start_offset + self.action_horizon
+            ]
+            image_is_pad_window = image_is_pad[self.video_sample_indices]
             has_pad = False
             if bool(action_is_pad.any().item()):
                 has_pad = True
-            if bool(image_is_pad.any().item()):
+            if bool(image_is_pad_window.any().item()):
                 has_pad = True
-            if bool(proprio_is_pad.any().item()):
+            if bool(proprio_is_pad_window.any().item()):
                 has_pad = True
 
             if not has_pad or attempt >= self.max_padding_retry:
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))
-        
+
         image_is_pad = sample["image_is_pad"]
 
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
@@ -196,17 +282,26 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
 
-        # Proxy (from lerobot): 
-        #   action: [num_frames-1, action_dim] # start from t0, except the last frame
-        #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        # Proxy (from lerobot, after BaseLerobotDataset right-shifts action by `action_start_offset`):
+        #   action : [action_horizon, action_dim] starting from raw step `action_start_offset`
+        #   proprio: [num_frames, proprio_dim] spanning the full obs window; slice to the 32-step
+        #            window aligned with `action`.
+        action = sample["action"]  # [action_horizon, action_dim]
+        proprio_full = sample["proprio"]  # [num_frames, state_dim]
+        proprio = proprio_full[self.action_start_offset: self.action_start_offset + self.action_horizon, :]
+        # proprio_is_pad key name is rewritten from `state_is_pad` by processor.preprocess().
+        proprio_is_pad_full = sample["proprio_is_pad"]
+        proprio_is_pad = proprio_is_pad_full[
+            self.action_start_offset: self.action_start_offset + self.action_horizon
+        ]
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
-            raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
-            )
+        assert action.shape[0] == self.action_horizon, (
+            f"`action` shape[0]={action.shape[0]} mismatch with `action_horizon`={self.action_horizon}"
+        )
+        assert proprio.shape[0] == self.action_horizon, (
+            f"`proprio` sliced shape[0]={proprio.shape[0]} mismatch with `action_horizon`={self.action_horizon}"
+        )
 
         task = sample["instruction"]
         
@@ -229,7 +324,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "context_mask": context_mask,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
-            "proprio_is_pad": sample["proprio_is_pad"],
+            "proprio_is_pad": proprio_is_pad,
         }
         return data
 

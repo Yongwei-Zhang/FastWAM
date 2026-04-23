@@ -16,7 +16,7 @@ load_text_encoder: false  # 使用预计算 T5 嵌入时不在模型内加载 T5
 # 由 OmegaConf 解析 ${data.train.processor.proprio_output_dim}，当前 LIBERO 任务在 configs/data/libero_2cam.yaml 中
 # 启动时若使用 task=libero_uncond_2cam224_1e-4（或任何在 defaults 里写了 override /data: libero_2cam 的 task），
 # 会加载 configs/data/libero_2cam.yaml，并挂到配置树的 data: 下。即相关参数在 libero_2cam.yaml 里设置，在这里加载
-# 如何确认？看当前 task 的 configs/task/*.yaml 里 defaults 的 /data: 选的是哪个
+# 如何确认？看当前 task 的 configs/task/*.yaml 里 defaults 的 /data: 选的是哪个（运行时把 data 侧的值借过来）
 proprio_dim: ${data.train.processor.proprio_output_dim}  # 本体向量维度，与数据 processor 一致
 
 redirect_common_files: true  # 将常用缓存/权重路径重定向到本地目录

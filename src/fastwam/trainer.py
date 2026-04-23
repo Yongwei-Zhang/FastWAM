@@ -41,7 +41,12 @@ class Wan22Trainer:
     """
 
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
+        """
+        把 runtime.run_training 传来的 model / train_dataset / val_dataset / cfg 存到实例上，
+        并从 cfg 读出学习率、batch、epoch、max_steps（随后会被覆盖）、日志与存盘间隔等。
+        """
         self.model = model
+        # run_training → build_datasets(cfg.data) → instantiate(data_cfg.train) 得到 train_ds
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.cfg = cfg
@@ -94,13 +99,14 @@ class Wan22Trainer:
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
 
-        # Freeze non-trainable modules before optimizer/deepspeed initialization.
+        # Freeze non-trainable modules before optimizer/deepspeed initialization.冻结除 dit（及可选 proprio_encoder）外的参数
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
-        self._apply_dit_only_train_mode(self.model)
+        self._apply_dit_only_train_mode(self.model)  # 对 DiT 解冻，其中 proprio_encoder 是可选的训练参数
         trainable_params = list(self.model.dit.parameters())
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+            trainable_params.extend(list(proprio_encoder.parameters()))  # 对本体感知的 Encoder 解冻
+        # 优化器中只包含上面的 trainable_params
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -108,8 +114,10 @@ class Wan22Trainer:
             betas=(0.9, 0.95),
         )
         
+        # worker_init_fn 是传给 DataLoader(..., worker_init_fn=...) 的回调
+        # 在 num_workers > 0 时，每个数据加载子进程（0,1,...,num_workers-1）启动时 PyTorch 会调用一次 worker_init_fn(worker_id)
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
-        total_train_steps = self._estimate_total_train_steps()
+        total_train_steps = self._estimate_total_train_steps()  # 算出总优化步数并写回 self.max_steps
         self.max_steps = total_train_steps
         warmup_steps = int(total_train_steps * 0.05)
         self.scheduler = self._build_scheduler(
@@ -303,9 +311,14 @@ class Wan22Trainer:
 
     @staticmethod
     def _apply_dit_only_train_mode(model):
+        """优化器只注册上述可训练参数（dit 的参数 + 可选 proprio_encoder）
+        """
         model.eval()
+        # 作用到 video_expert、action_expert、vae、text_encoder（以及 mot 里先被关掉，但下面马上对 dit 再打开）等所有子模块参数
         model.requires_grad_(False)
         model.dit.train()
+        # 开启 dit 的训练参数，video_expert 和 action_expert 作为 MoT.mixtures 的子模块挂在 model.dit 下面，会参与训练并更新
+        # 长期保持冻结、且不进入「联合 DiT」优化器的是 vae、text_encoder（以及 tokenizer 等） 这类不在 dit 子树里
         model.dit.requires_grad_(True)
         proprio_encoder = getattr(model, "proprio_encoder", None)
         if proprio_encoder is not None:
@@ -355,8 +368,7 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
+            # Multi-anchor: divisibility is enforced downstream against denoise sampled transitions.
             action_horizon = int(action.shape[1])
 
         proprio = None
@@ -393,11 +405,14 @@ class Wan22Trainer:
 
     @torch.no_grad()
     def evaluate(self):
+        """在验证集上做轻量评估
+        """
         if self.val_dataset is None:
             return None
 
         model = self.accelerator.unwrap_model(self.model)
         was_dit_training = model.dit.training
+        # 对 unwrap 后的整个模型 eval()，包括 dit，这样 training_loss / infer / VAE 路径都按完整 eval 行为跑
         model.eval()
 
         # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
@@ -414,8 +429,20 @@ class Wan22Trainer:
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
         proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
-        input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
+
+        # Multi-anchor: feed 4*(N-1)+1 consecutive frames so VAE encoder produces N anchor latents.
+        num_anchor_frames = int(getattr(model, "num_anchor_frames", 1))
+        if num_anchor_frames > 1:
+            anchor_raw_len = 4 * (num_anchor_frames - 1) + 1
+            if anchor_raw_len > num_frames:
+                raise ValueError(
+                    f"eval sample has {num_frames} video frames, but num_anchor_frames={num_anchor_frames} "
+                    f"requires at least {anchor_raw_len}."
+                )
+            input_image = [video0[:, i].unsqueeze(0) for i in range(anchor_raw_len)]
+        else:
+            input_image = video0[:, 0].unsqueeze(0)
 
         # 2. inference and video saving
         infer_kwargs = {
@@ -564,6 +591,8 @@ class Wan22Trainer:
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
 
         if was_dit_training:
+            # 评估结束后把模块状态恢复成训练循环需要的样子
+            # 外壳 eval + 仅 dit（+proprio_encoder）train + 仅这两块要 grad
             self._set_dit_only_train_mode()
 
         result = {
@@ -662,7 +691,10 @@ class Wan22Trainer:
         )
 
     def train(self):
-        # 主训练：以 global_step（优化器步）为进度，直到达到 cfg 中的 max_steps。
+        """主训练：以 global_step（优化器步）为进度，直到达到 cfg 中的 max_steps。
+        """
+
+        # 进入 while 循环前调用一次，之后每个训练 step 里，只有 dit（和 proprio_encoder）处于训练模式且参与反传
         self._set_dit_only_train_mode()
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -672,7 +704,7 @@ class Wan22Trainer:
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
         # self.train_loader 的 Python 迭代器，每次从当前 epoch 中取出下一个 batch，驱动主循环一步步训练
-        data_iter = iter(self.train_loader)
+        data_iter = iter(self.train_loader)  # 在后面，Python 迭代器在取完本 epoch 里最后一个 batch 会自动执行 StopIteration
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
 
@@ -680,31 +712,35 @@ class Wan22Trainer:
             try:
                 # 从当前 epoch 的迭代器里取下一个 batch。成功则 batch_in_epoch 加一，表示本 epoch 里又走了一个 batch
                 # 一个 epoch 指的是把训练集（更准确说：train_loader 代表的那一轮数据）完整遍历一遍，从第一个 batch 读到耗尽触发 StopIteration
-                sample = next(data_iter)
+                sample = next(data_iter)  # 在内层不断取下一个 batch
                 self.batch_in_epoch += 1
             except StopIteration:
-                self.epoch += 1
+                self.epoch += 1  # epoch 是外层循环，里面的 batch 不断取，用于训练
                 self.batch_in_epoch = 0
                 # 分布式/断点续训时，sampler 里可能记着 “从第几个 batch 接着读” ；一轮扫完后要清掉偏移，下一轮从数据开头正常采样。
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)  # 一个 epoch 之后再创建一个 epoch
                 continue
 
-            # 梯度累积：窗口内多次 backward，仅在 sync_gradients 为 True 时做一次 step。
+            # 梯度累积上下文：窗口内多次 backward，仅在 sync_gradients 为 True 时做一次 step。
             with self.accelerator.accumulate(self.model):
                 # self.model 往往是 Accelerate 包了一层的模型（DistributedDataParallel / DeepSpeed 等）；否则拿到的是底层原始模型实例
                 # train_model 最终通常是底层模型类的实例：项目里常见的是 FastWAM / FastWAMJoint / FastWAMIDM（或视频基线 Wan22Core），取决于你当前 task/model 配置
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
-                # 混合精度自动类型转换上下文
+                # 混合精度自动类型转换上下文，在前向里启用自动混合精度（若配置为 fp16/bf16）
                 with self.accelerator.autocast(): 
-                    # src/fastwam/models/wan22/fastwam.py 中给出 training_loss
+                    # 以 FastWAM 为例：内部 build_inputs(sample)（VAE 编码视频、搬设备/类型）→ video_expert.pre_dit / action_expert.pre_dit
+                    # → MoT → post_dit → 视频/动作 MSE + 调度器权重 → loss_total
                     loss, loss_dict = train_model.training_loss(sample)
+
                 # 对当前 micro-batch 的 loss 反向传播；在 accumulate 窗口内梯度累加，直至 sync_gradients 再 step。
+                # 把计算图从 loss 往回传到可训练参数 的入口，并与 accumulate / 多卡 / AMP 对齐
                 self.accelerator.backward(loss)  # Accelerate 统一处理混合精度与分布式梯度
 
                 if self.accelerator.sync_gradients:
                     # 梯度已同步：执行一次优化步；聚合跨卡标量；主进程写训练日志与 wandb；按间隔 eval、存盘；达 max_steps 则收尾退出。
+                    # 把 optimizer / scheduler / global_step / 日志 eval ckpt 绑在「累积满一次」的那一拍上，避免每个 micro-batch 都更新参数
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)  # 全局范数裁剪
                     self.optimizer.step()  # 参数更新
                     if not self.accelerator.optimizer_step_was_skipped:  # 本步未因 inf/nan 等被跳过时
@@ -725,7 +761,8 @@ class Wan22Trainer:
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])  # 当前组学习率
 
-                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:  # 按间隔且仅主进程
+                    # 按间隔且仅主进程，存储训练信息
+                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()  # 预估剩余时间与吞吐
                         description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
                             self.epoch,

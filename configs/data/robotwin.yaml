@@ -21,9 +21,12 @@ train:
       - key: default
         raw_shape: 14 # before transform
         shape: 14 # after transform
-  num_frames: 33
+  num_anchor_frames: ${model.num_anchor_frames}
+  num_denoise_latent_frames: 2
+  num_frames: ${latent_window_to_num_frames:${data.train.num_anchor_frames},${data.train.num_denoise_latent_frames},${data.train.action_video_freq_ratio},4}
+  action_horizon: ${latent_window_to_action_horizon:${data.train.num_denoise_latent_frames},${data.train.action_video_freq_ratio},4}
   global_sample_stride: 1
-  action_video_freq_ratio: 4 # 32 action, 9 video frames
+  action_video_freq_ratio: 4
   video_size: [384, 320] # final resize video
   camera_key: null
   val_set_proportion: 0.01
@@ -35,6 +38,7 @@ train:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}
     num_obs_steps: ${data.train.num_frames}
+    num_action_steps: ${data.train.action_horizon}
     num_output_cameras: 3
     action_output_dim: 14
     proprio_output_dim: 14
@@ -84,9 +88,12 @@ val:
       - key: default
         raw_shape: 14 # before transform
         shape: 14 # after transform
-  num_frames: 33
+  num_anchor_frames: ${data.train.num_anchor_frames}
+  num_denoise_latent_frames: ${data.train.num_denoise_latent_frames}
+  num_frames: ${data.train.num_frames}
+  action_horizon: ${data.train.action_horizon}
   global_sample_stride: 1
-  action_video_freq_ratio: 4 # 32 action, 9 video frames
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
   video_size: [384, 320] # final resize video
   camera_key: null
   val_set_proportion: 0.01
@@ -97,7 +104,8 @@ val:
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}
-    num_obs_steps: ${data.train.num_frames}
+    num_obs_steps: ${data.val.num_frames}
+    num_action_steps: ${data.val.action_horizon}
     num_output_cameras: 3
     action_output_dim: 14
     proprio_output_dim: 14

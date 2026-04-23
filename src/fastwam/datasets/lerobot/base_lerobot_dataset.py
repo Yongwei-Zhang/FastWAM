@@ -25,6 +25,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         past_action_size: int = 0, # Excludes the current frame
         obs_size: int = 1, # should be 
         past_obs_size: int = 0,
+        action_start_offset: int = 0,
 
         # train vs val
         val_set_proportion: float = 0.05, 
@@ -37,13 +38,17 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
         assert past_obs_size == 0
-        assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
-        
+        assert action_start_offset >= 0, f"`action_start_offset` must be >= 0, got {action_start_offset}"
+        # Multi-anchor: action window is right-shifted by `action_start_offset` raw steps;
+        # state window still spans obs_size full frames (aligned with image), proprio slicing
+        # is done downstream in RobotVideoDataset._get().
+
         self.dataset_dirs = dataset_dirs
         self.shape_meta = shape_meta
         self.action_size = action_size
         self.past_action_size = past_action_size
         self.obs_size = obs_size
+        self.action_start_offset = int(action_start_offset)
         self.processor = None  # Will be set externally
         metas = []
         for ds_dir in dataset_dirs:
@@ -83,7 +88,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for meta in self.action_meta:
             key = meta["key"]
             meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
-            delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
+            delta_timestamps[meta["lerobot_key"]] = [
+                (t * global_sample_stride) / fps
+                for t in range(
+                    -past_action_size + self.action_start_offset,
+                    -past_action_size + self.action_start_offset + action_size,
+                )
+            ]
 
         episodes = {}
         if val_set_proportion < 1e-6:

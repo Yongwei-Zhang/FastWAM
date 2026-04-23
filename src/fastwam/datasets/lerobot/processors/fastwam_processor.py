@@ -40,9 +40,11 @@ class FastWAMProcessor(BaseProcessor):
 
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
+        num_action_steps: Optional[int] = None,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
+        self.num_action_steps = int(num_action_steps) if num_action_steps is not None else (num_obs_steps - 1)
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
@@ -266,6 +268,13 @@ class FastWAMProcessor(BaseProcessor):
             sample["action_is_pad"] = data["action_is_pad"] # [action_horizon,]
             sample["action_dim_is_pad"] = data["action_dim_is_pad"] # [action_dim,]
             assert sample["action"].shape[-1] == self.action_output_dim
+            # Multi-anchor defence: RobotVideoDataset already guarantees action length == action_horizon
+            # == num_action_steps via __init__ + _get() asserts; this is an extra belt-and-suspenders
+            # check in case a future caller bypasses the dataset layer.
+            assert sample["action"].shape[0] == self.num_action_steps, (
+                f"`action` shape[0]={sample['action'].shape[0]} mismatch with "
+                f"`num_action_steps`={self.num_action_steps}"
+            )
             # sample["action"][sample["action_is_pad"], :-1] = 0.0 # NOTE: we assume use delta_eef_pose + gripper， so pad action is 0
 
         
@@ -299,6 +308,12 @@ class FastWAMProcessor(BaseProcessor):
             for trans in reversed(self.action_state_transforms):
                 data = trans.backward(data)
 
+        # NOTE(multi-anchor): this slice is legacy baseline (N=1) behaviour and is currently dead
+        # code in this repo (eval/deploy implement their own `_denormalize_action`). Under
+        # multi-anchor `data["action"]` has shape [B, action_horizon, D] with no extra obs-aligned
+        # prefix, so `[:, num_obs_steps-1:, :]` produces an empty tensor. If you resurrect this
+        # path, set `start_obs_step = 0` because the dataset already right-shifts action by
+        # `4*action_video_freq_ratio*(num_anchor_frames-1)` raw steps.
         start_obs_step = self.num_obs_steps - 1
         data["action"] = dict_apply(data["action"], lambda x: x[:, start_obs_step:, :])
         return data

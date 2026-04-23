@@ -439,10 +439,9 @@ class WanVideoDiT(torch.nn.Module):
                     raise ValueError(f"`action` last dimension must be {self.action_dim}, got {action.shape[2]}")
                 if num_latent_frames <= 1:
                     raise ValueError(f"video length must be > 1 for action-conditioned model, got {num_latent_frames}")
-                if action.shape[1] % (num_latent_frames - 1) != 0:
-                    raise ValueError(
-                        f"action horizon must be divisible by (num_latent_frames - 1), got action_horizon={action.shape[1]}"
-                    )
+                # Multi-anchor: action attends only to `num_latent_frames - num_anchor_frames`
+                # denoise groups; final divisibility check deferred to `pre_dit` where
+                # `num_anchor_frames` is known.
         if context_mask is None:
             context_mask = torch.ones((context.shape[0], context.shape[1]), dtype=torch.bool, device=context.device)
         else:

@@ -1,11 +1,37 @@
 ---
+description: 
+alwaysApply: true
+---
+
+---
 description: FastWAM 项目介绍
 alwaysApply: true
 ---
 
+## Agent 核心原则：绝对精简，代码/解释直出
+
+### 1. 零废话底线
+- 只输出面向问题的最核心内容，略去非必要补充解释
+- 禁止背景分析与客套话（如"好的"、"没问题"）
+- 不问"是否需要"，不列多选项，直接提供唯一最优解
+
+### 2. 纯净代码输出
+- 代码注释：仅在有必要的地方给出
+- 禁止：相关文档、测试代码、示例、重构未要求区域（除非明确指令）
+- 只输出被修改的函数或代码块，不重新输出未修改的完整文件
+- 提供完整替换块，内部逻辑禁止使用 `...` 省略
+
+### 3. 行为规范
+- 不自作主张添加额外功能、边界处理或过度优化
+- 若需求完全无法编码，仅提问一个最核心问题，禁止脑补假设
+- 回答中禁止包含思考过程，只显示不含思考的最终回答
+- 没有主动要求指出相关代码位置时，禁止输出代码位置及内容
+- 要求指出相关代码位置时，只输出文件名和代码所在行数，禁止输出具体代码内容（除非明确指令）
+
+
 ## 项目概述
 
-**FastWAM**（Fast World Action Model）是一个基于 Wan2.2-TI2V-5B 视频扩散模型的机器人动作预测系统。它采用 Mixture of Transformers (MoT) 联合处理视频 token 流和动作 token 流，能够仅从观察图像（或多帧）直接预测动作，而无需在测试时生成未来视频帧。支持可配置的 `num_anchor_frames` 进行多帧历史条件输入（详见 `thoughts/` 目录中的实验计划和实现细节）。
+**FastWAM**（Fast World Action Model）是一个基于 Wan2.2-TI2V-5B 视频扩散模型的机器人动作预测系统。它采用 Mixture of Transformers (MoT) 联合处理视频 token 流和动作 token 流，能够仅从观察图像（或多帧）直接预测动作，而无需在测试时生成未来视频帧。支持可配置的 `num_anchor_frames` 进行多帧历史条件输入。
 
 ## 架构说明
 
@@ -70,10 +96,7 @@ configs/train.yaml           (基础配置：batch、lr、epochs、精度、wand
 
 ## 多锚点帧（`num_anchor_frames`）
 
-可在 `configs/model/fastwam*.yaml` 中配置，用于控制作为干净条件输入的潜空间帧数。默认值为 1（原始单第一帧行为）。
-
-- `num_anchor_frames` 在**潜空间**工作：VAE 编码后 `T_latent = 1 + (T_raw - 1) // 4`
-- 当前 `num_frames=9`（3 个潜空间帧）时，最大锚点帧数为 2（需预留至少 1 帧用于去噪）
-- 推理时每帧观察图像独立进行 VAE 编码并拼接（无 T%4==1 限制）
-- 评估脚本（`eval_libero_single.py`、`deploy_policy.py`）维护一个 `deque(maxlen=num_anchor_frames)` 的帧缓冲区，每个环境步更新
-- 详细实现说明见：`thoughts/multi-anchor-impl.md`
+- **语义**：`N=model.num_anchor_frames` 为 anchor latent 数，`M=data.train.num_denoise_latent_frames` 为去噪段 latent 数；`num_frames`、`action_horizon` 由 `config_resolvers.py` 的 `latent_window_to_*` 从 `configs/data/*.yaml` 推导，**勿**在 `configs/model/*.yaml` 写 `num_denoise_latent_frames`（工厂 `create_fastwam*` 不认该字段）。
+- **训练/切换**：Hydra 覆盖 `model.num_anchor_frames=N`；数据集右移 action/proprio，`action_horizon` 仅随 M 与 `K_vf`/`D_vae` 变，改 N 一般不改 action 步数。
+- **文档**：设计/迁移见 `mawam_dev/plans_and_actions/multi_anchor/plan_opus4.7_v2.4.md`，落地与参数表见 `action_v2.4.md`；机制综述见 `multi_annchor_report.md`。
+- **兼容（v2.4.1）**：ckpt 存 `num_anchor_frames`，跨 N 载入会 WARNING；eval/deploy 若 `EVALUATION.action_horizon` 与 `data.train.action_horizon` 不一致会 WARNING；dataset 初始化会打 episode 长度摘要。

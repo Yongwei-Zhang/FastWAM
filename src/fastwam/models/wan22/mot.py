@@ -269,11 +269,13 @@ class MoT(nn.Module):
         video_attention_mask: torch.Tensor,
     ) -> list[dict[str, torch.Tensor]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
+        per-layer 指的是 MoT 里 video expert 的每一个 Transformer block，且 2 个 expert 的 layer 数相同
+        在每一层都要进行混合注意力堆叠。每一层预填时在该 block 上算出一对 k/v 存进 cache
 
         Args:
             video_tokens: Video tokens before layer 0, shape [B, Sv, D].
-            video_freqs: Video RoPE frequencies, shape [Sv, 1, rope_dim].
-            video_t_mod: Video time modulation tensor.
+            video_freqs: Video RoPE frequencies, shape [Sv, 1, rope_dim].  # RoPE，管位置
+            video_t_mod: Video time modulation tensor.  # 视频 expert 里各层 DiT block 用的「时间调制」张量，管扩散步时刻对整层行为的缩放/门控
             video_context_payload: Optional dict for video cross-attention.
                 - `context`: encoder states [B, L, D]
                 - `mask`: attention mask [B, Sv, L] or [B, 1, Sv, L]
@@ -284,6 +286,16 @@ class MoT(nn.Module):
             Each entry contains:
                 - `k`: video key tensor [B, Sv, H*Dh]
                 - `v`: video value tensor [B, Sv, H*Dh]
+            其中 Sv 指的是整段视频 Token 序列长度，等于：潜空间时间长度 f（num_anchor_frames）* 每帧空间 token 数 tokens_per_frame 组成
+            tokens_per_frame = (H_lat//p_h) * (W_lat//p_w)，由 pre_dit 在 patchify 之前用 latent 的 H、W 与 patch_size 算出来
+
+        计算得到的 kv_cache 会作为 forward_action_with_video_cache 的 video_kv_cache 参数
+        在 infer_action（或同类路径）里 每一步动作去噪 时使用
+
+        具体用法（每层）：
+        动作 expert 在该层算出 q_action, k_action, v_action 后，把 预填的 k、v 当作 视频侧 的 key/value，
+        与当前步的 k_action、v_action 在序列维上 拼接：k_cat = [k_video_cached, k_action]，v_cat 同理；
+        再用 动作行的联合掩码 做 _mixed_attention，让 动作 token 的 query 同时 attend 到锚点视频的 K/V（缓存）和当前动作序列的 K/V。
         """
         if "video" not in self.mixtures:
             raise ValueError("MoT requires `video` expert for `prefill_video_cache`.")
@@ -343,7 +355,15 @@ class MoT(nn.Module):
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
             )
+
+            # k：该层 video 自注意力里，K 投影 + norm_k + RoPE 后的 key，shape=[B, Sv, H*Dh]
+            # v：该层 V 投影后的 value（不做 RoPE），shape=[B, Sv, H*Dh]
+            # K 投影、V 投影 指的是 Transformer 自注意力里两条独立的线性变换；
+            # K 决定 “和谁对齐”（与Query相乘得到相似度），V 决定 “对齐后取什么内容”
+            # Sv：video_tokens.shape[1]，视频 token 数（与 video_attention_mask 的 Sv 一致）
+            # H*Dh：num_heads * attn_head_dim，视频 expert 的注意力头维拼接
             kv_cache.append({"k": k, "v": v})
+
         return kv_cache
 
     def forward_action_with_video_cache(
@@ -390,14 +410,20 @@ class MoT(nn.Module):
                 "`attention_mask` seq length mismatch: "
                 f"mask={attention_mask.shape[0]} vs expected_total={total_seq_len}"
             )
+
         # Use the action query rows from the joint [video+action] mask.
+        # 联合序列的 2 值矩阵，形状为 [S, S]，前 Sv 列对应视频，后 Sa 列对应动作；为 每个动作 Q 行 指定 能读哪些 K 列
+        # 本函数里 Q 只有动作，因此 mask 只要后面的 Sa 行，但是列仍然取满为 S=Sv+Sa，与 K/V 的拼接长度对齐
         action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
 
+        # self.mixtures 是 MoT 里按名字挂的 多个 DiT/Transformer expert 的 ModuleDict
+        # 这里取出 处理动作 token 的那一套 blocks（与视频 expert 层数、头维一致）
         expert = self.mixtures["action"]
         x = action_tokens
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
             # Action query/key/value are still step-dependent and must be recomputed each step.
+            # 从当前动作隐状态 只 算出 动作的 q_action（及 k_action、v_action）
             (
                 q_action,
                 k_action,
@@ -412,8 +438,8 @@ class MoT(nn.Module):
                 expert=expert,
                 block=block,
                 x=x,
-                freqs=action_freqs,
-                t_mod=action_t_mod,
+                freqs=action_freqs,  # 动作序列上 RoPE（旋转位置编码），给自注意力加上 「第几个动作步 / 序列位置」 信息
+                t_mod=action_t_mod,  # AdaLN 调制量（供每层拆成 shift / scale / gate 等），管「当前是第几个扩散步、噪声多强」
             )
             layer_cache = video_kv_cache[layer_idx]
             if "k" not in layer_cache or "v" not in layer_cache:
@@ -429,14 +455,19 @@ class MoT(nn.Module):
                 )
 
             # Mixed attention: action queries attend to cached video K/V plus current action K/V.
+            # 混合注意力：query 只用动作侧：q_cat=q_action；key/value 用拼接后的 [视频缓存 | 当前动作]
+            # 再用 action_attention_mask（联合掩码里 动作行）约束 “动作 Q 能看哪些 K/V 位置”，最后得到 mixed 进 post-block 更新 x
             k_cat = torch.cat([k_video, k_action], dim=1)
             v_cat = torch.cat([v_video, v_action], dim=1)
             mixed = self._mixed_attention(
                 q_cat=q_action,
                 k_cat=k_cat,
                 v_cat=v_cat,
-                attention_mask=action_attention_mask,
+                attention_mask=action_attention_mask,  # q_action 只对 k_cat/v_cat 做注意力，action_attention_mask 约定了注意力的位置
             )
+            # 在 自注意力已经产出 mixed_slice 之后，按层完成 DiT block 后半段 的包装函数
+            # 在混合注意力之后，完成 本层 block 的「残差 + 可选 cross-attn + MLP」，得到 下一层 Transformer Block 用的隐状态 x
+            # x 指的是当前层 Block 输出之后的动作 Token 隐向量，[B, Sa, D]（D 为 hidden dim），算完之后再传入下一层，得到Q/K/V和混合注意力
             x = self._apply_post_with_optional_checkpoint(
                 block=block,
                 residual_x=residual_x,
@@ -448,6 +479,7 @@ class MoT(nn.Module):
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
             )
+
         return x
 
     # self.mot() 调用时的函数

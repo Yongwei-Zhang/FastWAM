@@ -107,27 +107,9 @@ def create_fastwam(
     device: str = "cuda",
     num_anchor_frames: int = 1,
 ):
-    """Hydra ``_target_`` 工厂：把 fastwam.yaml 里的模型段转成可训练 ``FastWAM`` 实例。
-    以下参数，在 fastwam.yaml 中给出
-    - ``model_id``: Wan2.2 底模在 HuggingFace 上的仓库 id（权重来源）。
-    - ``tokenizer_model_id``: UMT5 分词器所在仓库 id（与 Wan 管线一致）。
-    - ``video_dit_config``: 视频 DiT 结构/超参 dict，交给 ``from_wan22_pretrained``。
-    - ``tokenizer_max_len``: 文本序列最大长度（token 截断上界）。
-    - ``load_text_encoder``: 是否在模型内加载 UMT5 文本编码器；``False`` 时用数据侧预计算 context。
-    - ``proprio_dim``: 本体向量维度；无本体条件则 ``None``。
-    - ``action_dit_config``: 动作 DiT 子配置；空 dict 表示用 ``FastWAM`` 内建默认。
-    - ``action_dit_pretrained_path``: 动作 DiT 权重路径；``None`` 则仅插值初始化等逻辑由 ``from_wan22_pretrained`` 决定。
-    - ``skip_dit_load_from_pretrain``: 为 ``True`` 时跳过从 Wan 预训练加载 VideoDiT（调试/消融）。
-    - ``video_scheduler``: 视频分支连续扩散调度参数（``train_shift`` / ``infer_shift`` / ``num_train_timesteps`` 等）。
-    - ``action_scheduler``: 动作分支调度，上述键必填（与视频可不同）。
-    - ``loss``: 训练总损失里 ``lambda_video``、``lambda_action`` 等权重。
-    - ``mot_checkpoint_mixed_attn``: MoT 混合注意力路径是否开 gradient checkpoint 省显存。
-    - ``redirect_common_files``: 是否把缓存/常用文件重定向到项目约定本地路径。
-    - ``model_dtype``: 模型权重的 ``torch.dtype``（与 mixed precision 对齐）。
-    - ``device``: 模型放置的设备描述串（如 ``cuda:0``）。
-    - ``num_anchor_frames``: 潜空间锚点帧数（干净条件帧数，多帧历史条件）。
-
-    作用：校验/展开各 dict 配置，调用 ``FastWAM.from_wan22_pretrained`` 加载 Wan2.2 并组装 MoT、动作头与调度，返回训练/推理用 ``FastWAM``。
+    """Hydra 在 configs/model/fastwam.yaml 里通过 _target_: fastwam.runtime.create_fastwam 指向的模型工厂。
+    把 YAML 里的视频 DiT / ActionDiT / scheduler / loss 等参数从 DictConfig 转成普通 dict，做必填校验，
+    最后调用 FastWAM.from_wan22_pretrained(...)，得到可在设备上训练的 FastWAM 实例。不负责数据加载。
     """
     from .models.wan22.fastwam import FastWAM
 
@@ -178,7 +160,7 @@ def create_fastwam(
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
     # 加载预训练 Wan2.2 并构建 FastWAM 各头与训练 loss 权重
-    # 返回的结果是 run_training 函数中的 model 变量
+    # 返回的结果是 run_training 函数中的 model 变量，在这里 定义并得到 video_expert、action_expert、mot，再 传给 FastWAM(...)
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -384,12 +366,11 @@ def create_fastwam_idm(
 
 
 def build_datasets(data_cfg: DictConfig):
-    # 训练集：若未指定统计文件路径，可能在 work_dir 下计算并保存 dataset_stats.json
-    # 数据根目录：本地 LeRobot 格式 的 LIBERO 数据集路径（如 ./data/libero_mujoco3.3.2/..._lerobot），由 RobotVideoDataset 读 episode、图像、动作等。
-    # 这里 data_cfg 的具体位置是：configs/data/libero_2cam.yaml
-    # instantiate(data_cfg.train) 会 import _target_ 指向的类并调用其构造函数，把除 _target_ 外的键当作关键字参数（嵌套的 processor 等也会递归实例化）。
-    # 返回的 train_ds 才是 RobotVideoDataset（或你配置的那个类）的实例。
-    # 类作用：把磁盘上的 LeRobot 轨迹变成「多帧视频条件 + 动作序列 + 文本嵌入」的训练张量管线
+    """
+    只接收 data_cfg（即 cfg.data）：用 instantiate(data_cfg.train) 建训练集；
+    若配置了 val 则再 instantiate 验证集（并处理 pretrained_norm_stats），否则验证集与训练集同一对象。
+    返回 (train_ds, val_ds)。不建模型。
+    """
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:
         # 未单独配置 val：复用训练集对象（如 LIBERO 常用）
@@ -426,7 +407,13 @@ def _resolve_train_device() -> str:
 
 
 def run_training(cfg: DictConfig):
-    # Hydra 训练入口：落盘配置、构建模型与数据集、委托 Wan22Trainer 执行训练循环。
+    """训练入口：打日志、登记工作目录、把完整 cfg 落盘；
+    解析本进程 device 与 mixed_precision → model_dtype；
+    instantiate(cfg.model, ...) 间接调用 create_fastwam
+    build_datasets(cfg.data) 得到数据集
+    构造 Wan22Trainer(cfg, model, train_ds, val_ds) 并 trainer.train()。
+    不实现具体训练步，只负责组装与委托。
+    """
     setup_logging(
         log_level=logging.INFO,
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
@@ -445,20 +432,19 @@ def run_training(cfg: DictConfig):
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)  # 映射到 torch.dtype 供权重 dtype
 
     # configs/model/fastwam.yaml 里 _target_: fastwam.runtime.create_fastwam
-    # _target_ 字符串 → _locate（hydra/_internal/instantiate/_instantiate2.py 中导入） → 实际 Python 可调用对象 → 一次普通函数调用
+    # 模型实例化的具体步骤：instantiate(cfg.model) → create_fastwam（模型工厂函数，在本文件中定义）
+    # → FastWAM.from_wan22_pretrained（拉 components.dit、建 ActionDiT、包 MoT）
+    # → FastWAM(video_expert, action_expert, mot, vae, …)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)  # 调用 create_fastwam 等工厂（在本文件中已定义）
 
     # train_ds：instantiate(data_cfg.train) 得到的训练用数据集（常为 RobotVideoDataset 等）
-    # 按 configs/data/*.yaml 的 train 段从 LeRobot 轨迹读 episode、图像、动作，做 processor/采样等，供 Wan22Trainer 做前向、反传、更新参数。
-    # val_ds：验证用数据集。若 data_cfg.val 为 None，则与 train_ds 同一对象（LIBERO 常见写法，验证与训练同源）
-    # 二者既是「RobotVideoDataset 类的实例」，也是「可供索引的数据集」（类的名称在 configs/data/libero_2cam.yaml 中给出）
     train_ds, val_ds = build_datasets(cfg.data)  # LeRobot 管线等由 data 配置决定
 
     # 将 cfg、模型与数据集交给 Trainer，内部负责 accelerate、优化器与日志。
     trainer = Wan22Trainer(
         cfg=cfg,
         model=model,
-        train_dataset=train_ds,
+        train_dataset=train_ds,  # 由 _build_datasets 构建，传给 Wan22Trainer 中用来做数据集
         val_dataset=val_ds,
     )  # 封装训练所需状态
 

@@ -9,8 +9,7 @@ defaults:
 
 output_dir: ./runs/train/${now:%Y-%m-%d}_${now:%H-%M-%S}
 
-# dataloading：Wan22Trainer._build_loader 里传给 PyTorch DataLoader 的参数
-# 处理对象：当前任务里合并的训练集（如 configs/data 下的 LeRobot / RobotVideoDataset：读 episode、多相机图、归一化动作等）
+# 在 task.yml 中会被覆盖
 batch_size: 2  # 每个训练步、每个进程一次从 DataLoader 取多少条样本（再乘 accelerator 进程数才是全局 batch）
 num_workers: 4  # DataLoader 用来并行拉取/预处理数据的子进程数。越小、越省内存，但更慢
 

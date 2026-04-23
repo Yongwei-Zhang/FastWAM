@@ -1,10 +1,9 @@
 # @package _global_
 
-# 这里定义了覆盖的 data 和 model
 defaults:
   - override /data: libero_2cam  # - configs/data/libero_2cam.yaml 中定义
   - override /model: fastwam  # - configs/model/fastwam.yaml 中定义
-  - _self_  # 本文件在 defaults 解析后再应用，保证此处覆盖生效
+  - _self_  # 本文件在 defaults 解析后再应用，保证此处覆盖生效（本文件中的参数会覆盖之前的默认值）
 
 # dataloading
 # 每步每个进程的样本数，如果设置过大容易导致 Libero 训练时 GPU OOM

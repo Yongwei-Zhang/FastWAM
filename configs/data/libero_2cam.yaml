@@ -30,10 +30,13 @@ train:
         raw_shape: 8 # before transform
         shape: 8 # after transform
 
-  # 采样窗口与多相机：num_frames 为原始步数；下采样后得到动作步数与视频帧数供 VAE。
-  num_frames: 33  # 观测序列长度（含首尾）；与 action 条数 num_frames-1 对齐
+  # 采样窗口与多相机：num_frames / action_horizon 由 num_anchor_frames + num_denoise_latent_frames 决定。
+  num_anchor_frames: ${model.num_anchor_frames}  # 潜空间锚点帧数（多锚点条件，dataset 需用来右移 action/proprio 窗口），data 侧也会从 model 侧获取参数
+  num_denoise_latent_frames: 2  # 去噪段的 latent 帧数（M）；决定 action 步数与视频总帧数
+  num_frames: ${latent_window_to_num_frames:${data.train.num_anchor_frames},${data.train.num_denoise_latent_frames},${data.train.action_video_freq_ratio},4}  # 自定义解析器，调 resolver 函数算出来
+  action_horizon: ${latent_window_to_action_horizon:${data.train.num_denoise_latent_frames},${data.train.action_video_freq_ratio},4}
   global_sample_stride: 1  # 数据集滑窗/帧索引的全局步长；在 固定长度窗口（obs_size 个观测步、action_size 个动作步）里，相邻两个下标之间在真实时间轴上隔多少帧
-  action_video_freq_ratio: 4  # 每 4 个原始步取 1 帧进视频；得 32 动作步、9 路视频帧
+  action_video_freq_ratio: 4  # 每 4 个原始步取 1 帧进视频
   video_size: [224, 448]  # 拼接后视频最终缩放的 [H,W]（双机位横拼宽为 2×224）
   camera_key: null  # 不按单相机键过滤，使用 shape_meta 中全部相机
   val_set_proportion: 0.0  # 验证集占比；0 表示不划验证
@@ -47,6 +50,7 @@ train:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor  # 样本后处理入口类
     shape_meta: ${data.train.shape_meta}  # 复用上文各模态 key 与目标形状
     num_obs_steps: ${data.train.num_frames}  # 观测序列长度，与数据集窗口一致
+    num_action_steps: ${data.train.action_horizon}  # 动作步数；多锚点配置下与 num_obs_steps-1 解耦
     num_output_cameras: 2  # 输出相机路数（可与实际路数对齐或补零）
     action_output_dim: 7  # eef_pose (6) + gripper (1)，最后 1 维表示目标开度，对应 LeRobot/LIBERO 里常见的 单通道 gripper action
     proprio_output_dim: 8  # eef_pose (6) + gripper (2)，最后 2 维表示夹爪相关状态 2 维，例如平行夹爪 左右指节关节位置 各 1 维，或等价的两维

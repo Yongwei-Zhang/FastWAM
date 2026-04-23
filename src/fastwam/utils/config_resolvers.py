@@ -54,6 +54,23 @@ def max_state_dim(embodiment_datasets_cfg):
                 
     return max_dim
 
+def latent_window_to_num_frames(
+    num_anchor_frames,
+    num_denoise_latent_frames,
+    action_video_freq_ratio,
+    vae_temporal_downsample_factor,
+) -> int:
+    return 1 + int(action_video_freq_ratio) * int(vae_temporal_downsample_factor) * (
+        int(num_anchor_frames) + int(num_denoise_latent_frames) - 1
+    )
+
+def latent_window_to_action_horizon(
+    num_denoise_latent_frames,
+    action_video_freq_ratio,
+    vae_temporal_downsample_factor,
+) -> int:
+    return int(action_video_freq_ratio) * int(vae_temporal_downsample_factor) * int(num_denoise_latent_frames)
+
 def register_default_resolvers() -> None:
     """
     Register all resolvers commonly used across entrypoints.
@@ -68,3 +85,5 @@ def register_default_resolvers() -> None:
     _register("sum_shapes", sum_shapes)
     _register("max_action_dim", max_action_dim)
     _register("max_state_dim", max_state_dim)
+    _register("latent_window_to_num_frames", latent_window_to_num_frames)
+    _register("latent_window_to_action_horizon", latent_window_to_action_horizon)

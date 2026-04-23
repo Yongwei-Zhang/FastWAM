@@ -39,14 +39,13 @@ from experiments.libero.libero_utils import (
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.utils.config_resolvers import register_default_resolvers as _register_resolvers
 from fastwam.utils.pytorch_utils import set_global_seed
+
+_register_resolvers()
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
 from action_ensembler import ActionEnsembler
-
-OmegaConf.register_new_resolver("eval", eval)
-OmegaConf.register_new_resolver("max", lambda x: max(x))
-OmegaConf.register_new_resolver("split", lambda s, idx: s.split("/")[int(idx)])
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -779,7 +778,7 @@ def run_single_task(
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
     return results
 
-
+# eval_libero_single 的 @hydra.main 入口
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
 def eval_single_process(cfg: DictConfig):
     start_time = time.time()
@@ -812,11 +811,33 @@ def eval_single_process(cfg: DictConfig):
     processor.set_normalizer_from_stats(dataset_stats)
     logging.info("Using dataset stats: %s", dataset_stats_path)
 
+    # Priority: CLI override (via EVALUATION.action_horizon) -> data.train.action_horizon
+    # -> legacy fallback num_frames-1 (single-anchor baseline only).
     action_horizon_cfg = cfg.EVALUATION.get("action_horizon", None)
-    if action_horizon_cfg is None:
-        action_horizon = int(cfg.data.train.num_frames) - 1
-    else:
+    data_action_horizon = cfg.data.train.get("action_horizon", None)
+    if action_horizon_cfg is not None:
         action_horizon = int(action_horizon_cfg)
+        # Multi-anchor guard: if the user baked `EVALUATION.action_horizon` in a legacy task
+        # config (often set to `num_frames - 1` = 48 under N=2), it will silently override the
+        # correct value (32) from `data.train.action_horizon`. Warn loudly so users can spot
+        # stale configs during migration.
+        if data_action_horizon is not None and int(data_action_horizon) != int(action_horizon_cfg):
+            logging.warning(
+                "EVALUATION.action_horizon=%d overrides data.train.action_horizon=%d. "
+                "Under multi-anchor the two MUST agree; set `EVALUATION.action_horizon: null` "
+                "in your sim_* config unless you intentionally want a different eval horizon.",
+                int(action_horizon_cfg), int(data_action_horizon),
+            )
+    elif data_action_horizon is not None:
+        action_horizon = int(data_action_horizon)
+    else:
+        action_horizon = int(cfg.data.train.num_frames) - 1
+        logging.warning(
+            "action_horizon fell back to `data.train.num_frames - 1` = %d; this path is only "
+            "valid for legacy single-anchor configs. Please add `action_horizon:` to "
+            "`data.train` (driven by `latent_window_to_action_horizon` resolver) for new tasks.",
+            action_horizon,
+        )
     if action_horizon <= 0:
         raise ValueError(f"EVALUATION.action_horizon must be positive, got {action_horizon}")
 

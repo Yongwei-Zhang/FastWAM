@@ -377,10 +377,36 @@ def get_model(usr_args: Dict[str, Any]):
         dataset_stats_path=usr_args.get("dataset_stats_path"),
     )
 
+    # Priority: CLI usr_args -> EVALUATION.action_horizon -> data.train.action_horizon
+    # -> legacy fallback num_frames-1 (single-anchor baseline only).
+    data_horizon = _parse_optional_int(cfg.data.train.get("action_horizon"))
     action_horizon = _parse_optional_int(usr_args.get("action_horizon"))
     if action_horizon is None:
         eval_horizon = _parse_optional_int(cfg.EVALUATION.get("action_horizon"))
-        action_horizon = eval_horizon if eval_horizon is not None else int(cfg.data.train.num_frames) - 1
+        if eval_horizon is not None:
+            action_horizon = eval_horizon
+            # Multi-anchor guard: see eval_libero_single.py for rationale. A stale
+            # `EVALUATION.action_horizon` baked into a sim_* config can silently override the
+            # correct value from `data.train.action_horizon`.
+            if data_horizon is not None and data_horizon != eval_horizon:
+                logger.warning(
+                    "EVALUATION.action_horizon=%d overrides data.train.action_horizon=%d. "
+                    "Under multi-anchor the two MUST agree; set `EVALUATION.action_horizon: null` "
+                    "in your sim_* config unless you intentionally want a different eval horizon.",
+                    eval_horizon, data_horizon,
+                )
+        else:
+            if data_horizon is None:
+                action_horizon = int(cfg.data.train.num_frames) - 1
+                logger.warning(
+                    "action_horizon fell back to `data.train.num_frames - 1` = %d; this path is "
+                    "only valid for legacy single-anchor configs. Please add `action_horizon:` "
+                    "to `data.train` (driven by `latent_window_to_action_horizon` resolver) for "
+                    "new tasks.",
+                    action_horizon,
+                )
+            else:
+                action_horizon = data_horizon
     if action_horizon <= 0:
         raise ValueError(f"`action_horizon` must be positive, got {action_horizon}")
 
